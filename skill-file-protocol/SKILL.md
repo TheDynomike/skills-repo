@@ -10,9 +10,16 @@ description: >
 
 ## Core Directives
 1. **Always Use Souls First:** You MUST NEVER read a raw source file in its entirety for general comprehension without FIRST checking for its Soul File.
-2. **Strict Persona Swapping:** To preserve token limits, you must explicitly swap your active persona between the "Base Soul" and specific "File Souls" during your task.
+2. **Strict Persona Swapping:** Every file interaction MUST be wrapped in explicit `SWAPPING PERSONA` and `YIELDING TO BASE SOUL` blocks. This is technical substance, NOT filler.
 3. **Always Update:** If a Soul File's state hash does not match the raw source, you MUST regenerate it before trusting its contents.
 4. **No Recursive Cascades:** Do NOT regenerate a Soul File simply because its dependencies changed. ONLY regenerate if the target file's own State Hash mismatches.
+
+## Compliance Check (Internal Monologue Requirement)
+Before any `edit` or `write` call, you must confirm:
+- [ ] Is current persona the correct File Soul?
+- [ ] Is the State Hash verified?
+- [ ] Is the Mission defined?
+- [ ] Is the Soul File updated post-edit?
 
 ---
 
