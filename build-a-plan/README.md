@@ -36,7 +36,7 @@ ROUND=1
 MAX_ROUNDS=5
 
 # ══════════════════  PHASE 1: INITIAL PLAN ══════════════════
-echo "[Phase 0] MODERATOR: Creating initial master plan..."
+echo "[Phase 0] MODERATOR: Creating initial build-a-plan..."
 
 plan=$(pi --system-prompt "$MODERATOR_PROMPT" "
 ## MODERATOR ROLE
@@ -120,7 +120,7 @@ RESULT: DISAGREE
 
   plan=$(pi --system-prompt "$MODERATOR_PROMPT" "
 ## MODERATOR UPDATE (Round $ROUND)
-You are the Lead Architect refining the master plan. Consensus was not reached. 
+You are the Lead Architect refining the build-a-plan. Consensus was not reached. 
 You must incorporate the following independent feedback from dissenting engineering personas into a more robust plan. 
 If their technical constraints conflict, resolve them logically to create a unified strategy.
 
