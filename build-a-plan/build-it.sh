@@ -167,7 +167,7 @@ create_file_if_missing "$TOOLS_DIR/debate_loop.sh" "
 echo 'Debate loop placeholder'
 "
 
-create_file_if_missing "$TOOLS_DIR/master_planner.sh" "
+create_file_if_missing "$TOOLS_DIR/build-a-plan.sh" "
 #!/bin/bash
 echo 'Master planner placeholder'
 "
