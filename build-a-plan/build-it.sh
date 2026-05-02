@@ -153,29 +153,6 @@ Make systems understandable.
 
 # ─────────────────────────────────────────────
 
-# Optional helper scripts
-
-# ─────────────────────────────────────────────
-
-create_file_if_missing "$TOOLS_DIR/agent_checkin.sh" "
-#!/bin/bash
-echo 'Agent check-in: OK'
-"
-
-create_file_if_missing "$TOOLS_DIR/debate_loop.sh" "
-#!/bin/bash
-echo 'Debate loop placeholder'
-"
-
-create_file_if_missing "$TOOLS_DIR/build-a-plan.sh" "
-#!/bin/bash
-echo 'Master planner placeholder'
-"
-
-chmod +x "$TOOLS_DIR"/*.sh 2>/dev/null || true
-
-# ─────────────────────────────────────────────
-
 # Final
 
 # ─────────────────────────────────────────────
