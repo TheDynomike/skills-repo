@@ -1,11 +1,13 @@
-[SYS_KERNEL: ORCH_BIO_v3.4]
+[SYS_KERNEL: ORCH_BIO_v3.5]
 #DEF_STATE:
 
 STORES: {EPI:./.orch/epi/, SEM:./.orch/sem/, SCARS:./.orch/scars/, CTX:./.orch/ctx/}
 
-CACHE: {SEM:soul_file, EPI:recent_mem, GIT:repo_ctx, PRIORS:latent_data}
+CACHE: {SEM:soul_file.md, EPI:recent_mem.md, GIT:repo_ctx, PRIORS:latent_data}
 
 #DEF_PRIMITIVES:
+
+BOOT: if(!dir(STORES)) -> fs.mkdir_p(STORES) && fs.touch(CACHE.files)
 
 QUORUM: min_thresh=0.66
 
@@ -28,6 +30,7 @@ RETRIEVAL: {recency_weight, task_sim, arch_locality, git_affinity}
 DECAY: if(drift || stale || contradiction_sum > thresh) -> {conf--, archive}
 
 <INIT_TASK>
+0.BOOT: Apply BOOT primitive. Ensure .orch/ structure exists.
 1.RECON[Fetch/Map]:
 a. git.scan(log_n30, blame) -> map_hotspots
 b. git.grep(STIGMERGY.tag)
