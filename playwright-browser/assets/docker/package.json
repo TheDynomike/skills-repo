@@ -1,0 +1,9 @@
+{
+  "name": "playwright-browser-server",
+  "version": "1.0.0",
+  "description": "Headless Playwright browser server",
+  "main": "server.js",
+  "dependencies": {
+    "playwright-core": "^1.49.1"
+  }
+}
