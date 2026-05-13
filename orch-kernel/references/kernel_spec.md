@@ -1,9 +1,13 @@
-[SYS_KERNEL: ORCH_BIO_v3.5]
+[SYS_KERNEL: ORCH_BIO_v3.9]
 #DEF_STATE:
 
-STORES: {EPI:./.orch/epi/, SEM:./.orch/sem/, SCARS:./.orch/scars/, CTX:./.orch/ctx/}
+STORES: {EPI:./.orch/epi/, SEM:./.orch/sem/, CTX:./.orch/ctx/}
 
 CACHE: {SEM:soul_file.md, EPI:recent_mem.md, GIT:repo_ctx, PRIORS:latent_data}
+
+#DEF_OUTPUT_SCHEMA:
+
+EMIT_STRICT_XML:  ->  ->  -> 
 
 #DEF_PRIMITIVES:
 
@@ -11,7 +15,7 @@ BOOT: if(!dir(STORES)) -> fs.mkdir_p(STORES) && fs.touch(CACHE.files)
 
 QUORUM: min_thresh=0.66
 
-STIGMERGY: tag="//SCENT:"
+STIGMERGY: marker="SCENT:", format=lang.comment_syntax(file) + marker
 
 REFLEXION: {fail}->{heuristic_gen}->{persist_epi}->{retry}
 
@@ -30,16 +34,17 @@ RETRIEVAL: {recency_weight, task_sim, arch_locality, git_affinity}
 DECAY: if(drift || stale || contradiction_sum > thresh) -> {conf--, archive}
 
 <INIT_TASK>
-0.BOOT: Apply BOOT primitive. Ensure .orch/ structure exists.
-1.RECON[Fetch/Map]:
+0.BOOT: Apply BOOT. Ensure .orch/ hierarchy exists.
+
+1.RECON[Fetch/Map] -> emit :
 a. git.scan(log_n30, blame) -> map_hotspots
-b. git.grep(STIGMERGY.tag)
+b. git.grep(STIGMERGY.marker)
 c. INFER(git_data) -> extract_{conventions, drift, fail_patterns}
 d. engine.retrieve(EPI, SEM) -> hydrate(git_blame_footprint)
 e. ctx.merge(SEM_sub, EPI, INFER, PRIORS)
 f. if(ctx.gap): facts = DEEP_RECALL(gap) -> ctx.merge(facts)
 
-2.QUORUM[Plan]:
+2.QUORUM[Plan] -> emit :
 a. if(ROUTING.fast_path) -> EXEC(N=1)
 b. else -> SWARM(N=3..5):
 loop(max=3):
@@ -47,7 +52,7 @@ props = N.gen_proposals(concurrent=T)
 if(agree(props) >= QUORUM) -> lock(plan) -> break
 else -> spawn(Tiebreaker)
 
-3.EXEC[Work]:
+3.EXEC[Work] -> emit :
 a. diff = execute(plan)
 b. if(SUCCESS): engine.inc_success(active_heuristics)
 c. if(ERR):
@@ -55,11 +60,9 @@ i. h = REFLEXION.gen("Why_fail, Invalid_Assump, Next_Step")
 ii. engine.persist(h, target=EPI)
 iii. goto(3a)
 
-4.COMPOUND[Persist/Scar]:
-a. env.inject(STIGMERGY.tag + " " + risk_summary)
+4.COMPOUND[Persist] -> emit :
+a. env.inject(STIGMERGY.format + " " + risk_summary)
 b. engine.promote() && engine.decay()
-c. if(repeat_failure_zone):
-create_scar(path, risk, mitigation) -> STORES.SCARS
-d. checkpoint(active_ctx, patterns, observations) -> STORES.CTX
-e. tokens.rem > 0 ? queue.next().budget += tokens.rem : null
+c. checkpoint(active_ctx, patterns, observations) -> STORES.CTX
+d. tokens.rem > 0 ? queue.next().budget += tokens.rem : null
 <END_TASK>
