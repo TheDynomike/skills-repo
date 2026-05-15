@@ -1,9 +1,10 @@
 # EZ-MODE
 Skip everything below and just follow this:
 ```bash
-# Download the SKILL file and put it in this directory
-# Activate your agent (pi, gemini, etc.)
-# Send this to your agent: install this skill globally: ./build-plan-go-SKILL.md
+# download the SKILL file and put it in this directory
+# activate your agent (pi, gemini, etc.)
+# ask your agent: install this skill globally: ./build-plan-go-SKILL.md
+# ask your agent: bpg ticket make simple web app that serves hello world home page && bpg run pipeline
 ```
 
 ---
