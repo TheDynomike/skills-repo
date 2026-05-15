@@ -1,3 +1,13 @@
+# EZ-MODE
+Skip everything below and just follow this:
+```bash
+# Download the SKILL file and put it in this directory
+# Activate your agent (pi, gemini, etc.)
+# Send this to your agent: install this skill globally: ./build-plan-go-SKILL.md
+```
+
+---
+
 # Build-Plan-Go (BPG)
 
 Build-Plan-Go is a multi-agent autonomous development workflow system that implements a bio-inspired, Kanban-style pipeline. It orchestrates specialized agents to handle planning, development, testing, and review with atomic precision and accumulated "tribal knowledge."
@@ -15,9 +25,8 @@ Build-Plan-Go is a multi-agent autonomous development workflow system that imple
 
 ## 📥 Installation
 
-Download the skill file and put it in the current directory and run:
-
 ```bash
+# Download the SKILL file and put it in this directory
 # Activate your agent (pi, gemini, etc.)
 install this skill globally: ./build-plan-go-SKILL.md
 ```
