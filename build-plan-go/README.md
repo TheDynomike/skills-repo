@@ -24,18 +24,22 @@ install this skill globally: ./build-plan-go-SKILL.md
 
 ## 🛠️ Quick Start
 
-1. **Initialize:** Run any BPG command in your project root to initialize the `.bpg/` directory structure.
+1. **Initialize:** Run `bpg init` to initialize the `.bpg/` directory folders.
 2. **Create Tickets:** Use the Master Planner to turn your ideas into a backlog.
    ```bash
    bpg ticket "Implement a REST API for user management"
    ```
-3. **Start the Pipeline:**
+3. **Run Pipeline:** Execute a task through the entire backlog, development, testing, and review process in one go.
+   ```bash
+   bpg ticket 'make simple html server that serves hello world home page' && bpg run pipeline
+   ```
+4. **Manual Progression:** Alternatively, run stages individually:
    ```bash
    bpg develop  # Pick up the highest priority ticket
    bpg test     # Audit the completed work
    bpg review   # Final sign-off
    ```
-4. **Monitor Progress:**
+5. **Monitor Progress:**
    ```bash
    bpg status      # See active agents and column counts
    bpg show board  # View the visual Kanban board
