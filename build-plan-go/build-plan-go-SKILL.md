@@ -1,12 +1,6 @@
 ---
 name: build-plan-go
-description: >
-  A multi-agent autonomous development workflow system implementing a kanban-style
-  pipeline with specialized agents for planning, development, testing, and review.
-  Uses bio-inspired quality gates and atomic ticket management. Trigger when users
-  want to manage software development tasks through an automated agent workflow, or
-  when they say commands like "bpg ticket", "bpg develop", "bpg test", 
-  "bpg review", "bpg status", or "bpg show board".
+description: "A multi-agent autonomous development workflow system implementing a kanban-style pipeline with specialized agents for planning, development, testing, and review. Uses bio-inspired quality gates and atomic ticket management. Trigger when users want to manage software development tasks through an automated agent workflow, or when they say commands like 'bpg ticket', 'bpg develop', 'bpg test', 'bpg review', 'bpg status', or 'bpg show board'."
 ---
 
 # Build-Plan-Go: Multi-Agent Development Workflow System
