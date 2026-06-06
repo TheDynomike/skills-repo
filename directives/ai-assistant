@@ -1,0 +1,1284 @@
+# Personal Memory System — Coding Agent Directive
+**Version:** 2.0  
+**Status:** Final  
+**Target:** Coding agent with filesystem, shell, and network access  
+**Runtime:** Private home server with local GPU(s), LiteLLM load balancer, llama.cpp backends
+
+---
+
+## 0. Prime Directives
+
+1. **Detect before you build.** Run Phase 1 completely before touching any files or writing any code. Output a detection report. Do not proceed until the report is complete.
+2. **Never overwrite existing data.** If a Qdrant collection exists with points, do not recreate it. If it has zero points, recreate only if schema is wrong.
+3. **Every write is idempotent.** Every task, every agent cycle, every upsert must be safe to re-run on the same data without side effects.
+4. **Fail loudly, degrade gracefully.** On any error: log it with full context, write to dead-letter, continue. Never silently swallow failures.
+5. **The system has two users of its output:** a human reading summaries, and an AI agent making programmatic queries. Both must be served. The `/query` endpoint returns structured data, not prose narration.
+
+---
+
+## 1. Architecture Overview
+
+```
+[ drop zone: ./drop/{user_id}/ ]
+          ↓
+[ ingest agent ]
+  - classify domain
+  - chunk + embed (local model)
+  - write to raw_ingest_{user_id}
+          ↓
+[ raw_ingest_{user_id} ]          ← per-user, never shared
+          ↓
+[ memory agent (per user) ]
+  - rotating sample strategies
+  - correlate + name entities
+  - check/update shared entity registry
+  - write/version memory_{user_id}
+  - validate predictions
+          ↓              ↓
+[ memory_{user_id} ]   [ entity_registry_{user_id} ]
+   versioned             personal layer over shared
+   longitudinal          canonical name + personal stats
+          ↓
+[ shared_entity_registry ]        ← shared across users
+   canonical names only            no behavioral data
+   alias resolution                no timestamps
+   normalization target            no co-occurrence
+          ↓
+[ /query?user={user_id} ]
+   structured RetrievalResult
+          ↓
+[ calling AI agent ]
+   use summary OR drill deeper
+```
+
+**Collections per user:** `raw_ingest_{uid}`, `memory_{uid}`, `entity_registry_{uid}`  
+**Shared collection:** `shared_entity_registry` (one, global)  
+**No graph database required.** Multi-hop traversal is handled in application code via two Qdrant searches with an in-memory join. Add Neo4j only if traversal depth regularly exceeds 4 hops or dataset exceeds personal scale.  
+**No separate compactor process.** The memory agent is the single intelligence layer. Entity naming happens inside its correlation step.
+
+---
+
+## 2. Phase 1 — Environment Detection (MANDATORY FIRST)
+
+Run every check. Do not skip. Output the full report before proceeding.
+
+### 2.1 Services
+
+```python
+# Check each service. Record: RUNNING | ABSENT
+# If ABSENT: check for Docker. If Docker available: provide start command.
+# If Docker unavailable: provide manual install instructions.
+
+services = {
+    "qdrant":    {"host": "localhost", "port": 6333, "health": "/healthz"},
+    "redis":     {"host": "localhost", "port": 6379},  # required for distributed lock
+    "litellm":   {"host": "localhost", "port": 4000, "health": "/health"},  # or configured port
+}
+```
+
+For LiteLLM specifically: if running, call `/models` and record which models are available. This determines which model handles extraction vs embedding.
+
+### 2.2 Runtime
+
+```
+- Python version (require >= 3.10)
+- Active virtualenv / conda env name
+- CUDA availability (nvidia-smi or torch.cuda.is_available())
+- GPU count and VRAM per GPU
+- llama.cpp: check if running, record endpoint and loaded models
+```
+
+### 2.3 Python Packages
+
+Check for all of the following. Record version if present, MISSING if absent:
+
+```
+qdrant-client >= 1.7
+sentence-transformers >= 2.0
+celery >= 5.3
+redis >= 5.0
+pydantic >= 2.0
+pydantic-settings
+python-dotenv
+fastapi
+uvicorn
+watchdog          # file watcher for drop zone
+tiktoken          # chunking
+httpx             # async LiteLLM calls
+numpy
+```
+
+### 2.4 Existing Data
+
+```python
+# If Qdrant is running:
+# - List all collections
+# - For each collection matching known patterns:
+#   record: name, vector_dim, point_count, payload_schema_sample (first point)
+# - Detect existing users from collection naming pattern raw_ingest_{uid}
+
+# Check .env for:
+REQUIRED_VARS = [
+    "LITELLM_BASE_URL",      # e.g. http://localhost:4000
+    "LITELLM_API_KEY",       # even if local, LiteLLM may require one
+    "EMBED_MODEL",           # model name as LiteLLM knows it
+    "EXTRACT_MODEL",         # model name for entity extraction
+    "REDIS_URL",
+    "QDRANT_URL",
+]
+```
+
+### 2.5 Detection Report Format
+
+```
+========================================
+DETECTION REPORT
+========================================
+timestamp:        ISO-8601
+
+SERVICES
+  qdrant:         RUNNING v1.x.x | ABSENT (docker: YES/NO)
+  redis:          RUNNING | ABSENT (docker: YES/NO)
+  litellm:        RUNNING at http://... | ABSENT
+  litellm_models: [list of available model names]
+  llamacpp:       RUNNING at http://... | ABSENT
+
+RUNTIME
+  python:         3.x.x
+  env:            venv @ /path | conda:name | system
+  cuda:           YES (N GPUs, Nx GB VRAM) | NO
+  llamacpp_model: [model names if running]
+
+PACKAGES
+  missing:        [list] | none
+
+ENVIRONMENT
+  LITELLM_BASE_URL:  SET | MISSING
+  LITELLM_API_KEY:   SET | MISSING
+  EMBED_MODEL:       value | MISSING
+  EXTRACT_MODEL:     value | MISSING
+  REDIS_URL:         SET | MISSING
+  QDRANT_URL:        SET | MISSING
+
+EXISTING DATA
+  collections:    [list with point counts and vector dims]
+  known_users:    [user_ids detected from collection names]
+  shared_registry: EXISTS (N points) | MISSING
+
+EMBED MODEL CONSISTENCY CHECK
+  configured_dim:   N
+  existing_collections_dim: [name: N, ...]
+  conflict:         YES → STOP, report mismatch | NO
+
+ACTION PLAN
+  install:        [packages]
+  start:          [services]
+  create_collections: [names with configs]
+  create_env_vars: [missing vars]
+  proceed_to:     Phase 2
+========================================
+```
+
+**STOP if:** embed model dimension conflicts with existing collections. Report the conflict. Do not proceed. Ask for resolution.
+
+---
+
+## 3. Phase 2 — Project Scaffold
+
+### 3.1 Directory Structure
+
+```
+personal-memory/
+├── .env.example
+├── .env                        # never commit
+├── docker-compose.yml          # qdrant + redis only
+├── requirements.txt
+├── config.py                   # Pydantic Settings
+├── collections.py              # collection configs, creation, validation
+├── ingest/
+│   ├── __init__.py
+│   ├── classifier.py           # lightweight domain tagger
+│   ├── chunker.py              # chunk + embed raw text
+│   ├── loader.py               # file parser per type
+│   └── watcher.py              # watchdog drop zone monitor
+├── memory_agent/
+│   ├── __init__.py
+│   ├── agent.py                # main cycle orchestrator
+│   ├── sampler.py              # rotating sample strategies
+│   ├── correlator.py           # LLM correlation + entity naming
+│   ├── taxonomy.py             # relationship vocabulary + normalizer
+│   ├── entity_registry.py      # canonical entity lookup + dedup
+│   ├── versioner.py            # category versioning + recurrence detection
+│   ├── predictor.py            # prediction lifecycle management
+│   └── tasks.py                # Celery tasks + beat schedule
+├── retrieval/
+│   ├── __init__.py
+│   ├── engine.py               # query routing + dual-layer retrieval
+│   └── drill.py                # drill-down helpers
+├── api/
+│   ├── __init__.py
+│   └── main.py                 # FastAPI
+├── migrations/
+│   ├── __init__.py
+│   ├── runner.py               # migration executor
+│   └── 001_initial_collections.py
+└── tests/
+    ├── test_detection.py
+    ├── test_ingest.py
+    ├── test_memory_agent.py
+    └── test_retrieval.py
+```
+
+### 3.2 config.py
+
+```python
+from pydantic_settings import BaseSettings
+from typing import Literal
+
+class Settings(BaseSettings):
+    # LiteLLM (unified local endpoint)
+    litellm_base_url: str = "http://localhost:4000"
+    litellm_api_key: str = "local"
+    extract_model: str          # must be set in .env
+    embed_model: str            # must be set in .env
+    embed_dim: int = 384        # must match embed_model output
+
+    # Infrastructure
+    qdrant_url: str = "http://localhost:6333"
+    redis_url: str = "redis://localhost:6379"
+
+    # Ingest
+    drop_zone: str = "./drop"
+    chunk_size_tokens: int = 512
+    chunk_overlap_tokens: int = 64
+    supported_extensions: list = [".txt", ".md", ".json", ".csv", ".pdf"]
+
+    # Memory agent
+    sample_batch_size: int = 50
+    sample_strategies: list = [
+        "temporal_window",
+        "semantic_cluster",
+        "cross_domain",
+        "recent_unseen",
+        "entity_neighborhood"
+    ]
+    agent_interval_seconds: int = 300
+    category_coherence_threshold: float = 0.65   # below = flag for split
+    category_merge_threshold: float = 0.92        # above = flag for merge
+    recurrence_similarity_threshold: float = 0.80
+    recurrence_entity_overlap_threshold: float = 0.60
+    prediction_pending_expiry_days: int = 30
+
+    # Entity registry
+    dedup_similarity_threshold: float = 0.88
+    dedup_levenshtein_max: int = 2
+
+    # Redis lock
+    lock_ttl_seconds: int = 240   # 4 min; compactor cycle < this
+
+    class Config:
+        env_file = ".env"
+```
+
+---
+
+## 4. Phase 3 — Collections
+
+### 4.1 Collection Definitions
+
+All collections use the same vector dimension (`settings.embed_dim`). **Never mix dimensions in one collection.** On first run, record `embed_model` and `embed_dim` in a `_meta` payload on a special sentinel point (id=0) in each collection. On subsequent runs, verify sentinel matches config before writing.
+
+```python
+COLLECTIONS = {
+    # Per-user (created on first user registration)
+    "raw_ingest_{uid}": {
+        "vector_dim": settings.embed_dim,
+        "distance": "Cosine",
+        "on_disk_payload": True,
+    },
+    "memory_{uid}": {
+        "vector_dim": settings.embed_dim,
+        "distance": "Cosine",
+    },
+    "entity_registry_{uid}": {
+        "vector_dim": settings.embed_dim,
+        "distance": "Cosine",
+    },
+    # Shared (created once globally)
+    "shared_entity_registry": {
+        "vector_dim": settings.embed_dim,
+        "distance": "Cosine",
+    },
+}
+```
+
+### 4.2 Point Schemas
+
+**raw_ingest_{uid}**
+```json
+{
+  "id": "uuid-v4",
+  "vector": [],
+  "payload": {
+    "raw_text": "string",
+    "source_type": "journal|finance|transcript|note|health|sleep|other",
+    "domain": "health|finance|social|nutrition|sleep|cognitive|environment",
+    "sub_domain": "string",
+    "domain_confidence": 0.0,
+    "source_path": "string",
+    "source_filename": "string",
+    "chunk_index": 0,
+    "chunk_total": 0,
+    "parent_source_id": "uuid",
+    "timestamp": "ISO-8601",
+    "day_of_week": 0,
+    "week_of_year": 0,
+    "time_of_day_bucket": "morning|afternoon|evening|night",
+    "year_month": "YYYY-MM",
+    "processed": false,
+    "processing_attempts": 0,
+    "embed_model": "string",
+    "embed_model_version": "string"
+  }
+}
+```
+
+**memory_{uid}**
+```json
+{
+  "id": "memory_{uuid}",
+  "vector": [],
+  "payload": {
+    "category_id": "memory_{uuid}",
+    "category_label": "string",
+    "current_status": "active|resolved|dormant|flagged",
+    "flagged_for": null,
+    "coherence_score": 0.0,
+    "overlap_score": 0.0,
+
+    "current_version": 1,
+    "versions": [
+      {
+        "version": 1,
+        "timestamp": "ISO-8601",
+        "summary": "string",
+        "member_point_ids": [],
+        "member_count": 0,
+        "confidence": 0.0,
+        "status": "active|resolved",
+        "sampling_strategy": "string",
+        "hash": "string"
+      }
+    ],
+
+    "named_entities": [
+      {
+        "name": "string",
+        "canonical_name": "string",
+        "type": "string",
+        "shared_entity_id": "entity_{uuid}",
+        "personal_entity_id": "entity_{uuid}",
+        "role_in_category": "trigger|outcome|context|modifier|co-occurrence",
+        "mention_count": 0
+      }
+    ],
+
+    "named_relationships": [
+      {
+        "from": "string",
+        "relation": "string",
+        "to": "string",
+        "avg_lead_time_days": null,
+        "confidence": 0.0,
+        "evidence_count": 0,
+        "causal_direction": "A->B|B->A|bidirectional|unknown"
+      }
+    ],
+
+    "predictions": [
+      {
+        "prediction_id": "pred_{uuid}",
+        "text": "string",
+        "confidence": 0.0,
+        "status": "pending|confirmed|refuted|expired",
+        "predicted_at": "ISO-8601",
+        "resolved_at": null,
+        "resolution_evidence": null
+      }
+    ],
+
+    "temporal": {
+      "first_active": "ISO-8601",
+      "last_active": "ISO-8601",
+      "resolution_date": null,
+      "recurrence_count": 0,
+      "cycles": [
+        {
+          "start": "ISO-8601",
+          "end": null,
+          "duration_days": null,
+          "severity": "high|moderate|low|unknown"
+        }
+      ],
+      "avg_cycle_duration_days": null,
+      "avg_gap_between_cycles_days": null,
+      "predicted_resolution": null,
+      "seasonal_signal": null,
+      "day_of_week_distribution": {}
+    },
+
+    "domain_distribution": {},
+    "time_range": {"earliest": "ISO-8601", "latest": "ISO-8601"},
+    "created_at": "ISO-8601",
+    "last_updated": "ISO-8601",
+    "embed_text": "string"
+  }
+}
+```
+
+**entity_registry_{uid}** (personal layer)
+```json
+{
+  "id": "entity_{uuid}",
+  "vector": [],
+  "payload": {
+    "shared_entity_id": "entity_{uuid}",
+    "canonical_name": "string",
+    "personal_aliases": [],
+    "type": "string",
+    "first_seen": "ISO-8601",
+    "last_seen": "ISO-8601",
+    "last_gap_days": 0,
+    "mention_count": 0,
+    "avg_interval_days": null,
+    "trend": "increasing|decreasing|stable|volatile|unknown",
+    "occurrence_timestamps": [],
+    "co_occurrence_scores": {},
+    "appears_in_categories": []
+  }
+}
+```
+
+**shared_entity_registry**
+```json
+{
+  "id": "entity_{uuid}",
+  "vector": [],
+  "payload": {
+    "canonical_name": "string",
+    "type": "Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity",
+    "aliases": [],
+    "description": "string",
+    "created_at": "ISO-8601",
+    "last_updated": "ISO-8601"
+  }
+}
+```
+
+Note: shared registry contains NO behavioral data, NO timestamps from user activity, NO co-occurrence data, NO mention counts. Only canonical identity.
+
+---
+
+## 5. Phase 4 — Ingest Agent
+
+### 5.1 File Watcher
+
+```python
+# watchdog monitors ./drop/{user_id}/ recursively
+# on CREATE event for supported extension:
+#   1. read + parse file (by extension)
+#   2. classify domain
+#   3. chunk
+#   4. embed each chunk
+#   5. write to raw_ingest_{user_id}
+#   6. move file to ./drop/{user_id}/processed/{filename}
+#     (never delete, never leave in place — prevents re-ingest on restart)
+```
+
+Supported parsers:
+- `.txt`, `.md` → read directly
+- `.json` → stringify or extract text fields (try `content`, `text`, `body`, `note` keys)
+- `.csv` → row-by-row, each row is a chunk candidate; respect `chunk_size_tokens` limit
+- `.pdf` → extract text with `pdfminer.six`; fall back to OCR warning if text extraction yields < 100 chars
+
+### 5.2 Domain Classifier
+
+**Do not use an LLM for this.** Use a local zero-shot classifier (`sentence-transformers` with NLI model) or a keyword/regex rule set. This runs on every ingest — it must be fast and never block.
+
+```python
+DOMAIN_LABELS = [
+    "health symptoms and medical",
+    "food and nutrition",
+    "financial transaction and spending",
+    "sleep and rest",
+    "social interaction and relationships",
+    "mood and mental state",
+    "physical activity and exercise",
+    "environment and location",
+]
+
+# classify → pick top label → map to domain enum
+# store confidence score
+# if confidence < 0.5: domain = "other", flag for review
+```
+
+### 5.3 Temporal Derivation
+
+Derive and store at write time. Never compute at query time.
+
+```python
+def derive_temporal(timestamp: datetime) -> dict:
+    return {
+        "day_of_week": timestamp.weekday(),        # 0=Monday
+        "week_of_year": timestamp.isocalendar()[1],
+        "year_month": timestamp.strftime("%Y-%m"),
+        "time_of_day_bucket": (
+            "morning"   if 5  <= timestamp.hour < 12 else
+            "afternoon" if 12 <= timestamp.hour < 17 else
+            "evening"   if 17 <= timestamp.hour < 21 else
+            "night"
+        )
+    }
+```
+
+### 5.4 Chunking
+
+```python
+# use tiktoken for token counting
+# chunk at settings.chunk_size_tokens with settings.chunk_overlap_tokens overlap
+# each chunk stores:
+#   chunk_index: int (0-based)
+#   chunk_total: int
+#   parent_source_id: uuid (shared across all chunks of same file)
+# embed text: f"{domain} {sub_domain}: {chunk_text}"
+#   prepending domain improves semantic clustering
+```
+
+### 5.5 Dead Letter
+
+On any write failure:
+```python
+# append to ./logs/failed_ingest.jsonl
+{
+  "timestamp": "ISO-8601",
+  "user_id": "string",
+  "source_path": "string",
+  "error": "string",
+  "traceback": "string",
+  "payload_preview": "first 200 chars"
+}
+```
+
+---
+
+## 6. Phase 5 — Memory Agent
+
+### 6.1 Celery Beat Schedule
+
+```python
+# tasks.py
+from celery import Celery
+from celery.schedules import timedelta
+
+app = Celery('memory', broker=settings.redis_url)
+
+app.conf.beat_schedule = {
+    'memory-agent-cycle': {
+        'task': 'memory_agent.tasks.run_memory_cycle',
+        'schedule': timedelta(seconds=settings.agent_interval_seconds),
+    },
+    'prediction-validator': {
+        'task': 'memory_agent.tasks.validate_predictions',
+        'schedule': timedelta(hours=6),
+    },
+    'coherence-audit': {
+        'task': 'memory_agent.tasks.audit_category_coherence',
+        'schedule': timedelta(hours=24),
+    },
+}
+```
+
+### 6.2 Distributed Lock
+
+```python
+import redis
+import time
+
+def acquire_lock(r: redis.Redis, user_id: str) -> bool:
+    key = f"memory_agent_lock:{user_id}"
+    # NX = only set if not exists, EX = TTL in seconds
+    return r.set(key, "1", nx=True, ex=settings.lock_ttl_seconds)
+
+def release_lock(r: redis.Redis, user_id: str):
+    r.delete(f"memory_agent_lock:{user_id}")
+```
+
+Always wrap the full agent cycle in lock acquire/release. If acquire returns False, skip cycle and log.
+
+### 6.3 Sampling Strategies
+
+The agent rotates through strategies. Track `last_strategy_used` in a Redis key per user. On each cycle, pick the next strategy in rotation.
+
+```python
+strategies = {
+
+    "temporal_window": lambda: scroll_qdrant(
+        collection=f"raw_ingest_{uid}",
+        filter={"year_month": current_or_recent_month()},
+        limit=50, randomize=True
+    ),
+
+    "semantic_cluster": lambda: (
+        seed := random_point(f"raw_ingest_{uid}"),
+        search_qdrant(f"raw_ingest_{uid}", seed.vector, limit=50)
+    ),
+
+    "cross_domain": lambda: flatten([
+        scroll_qdrant(f"raw_ingest_{uid}",
+                      filter={"domain": d}, limit=10, randomize=True)
+        for d in random.sample(DOMAIN_LABELS, 5)
+    ]),
+
+    "recent_unseen": lambda: scroll_qdrant(
+        collection=f"raw_ingest_{uid}",
+        filter={"processed": False},
+        limit=50, order_by="timestamp desc"
+    ),
+    # note: 'processed' here means 'seen by memory agent'
+    # separate flag from ingest processed flag
+    # use payload field: memory_agent_seen: bool
+
+    "entity_neighborhood": lambda: (
+        entity := random_entity(f"entity_registry_{uid}"),
+        scroll_qdrant(f"raw_ingest_{uid}",
+                      filter={"entities_mentioned": entity.canonical_name},
+                      limit=50)
+    ),
+}
+```
+
+### 6.4 Correlation + Entity Naming (LiteLLM Call)
+
+Group sampled points by `parent_source_id` before sending to LLM. Points sharing a parent are siblings from the same document — send them together as one extraction unit, not separately. This prevents contradictory entity sets from the same source.
+
+**System prompt:**
+```
+You analyze personal life data and extract structured patterns.
+Return ONLY valid JSON. No preamble, no markdown fences, no commentary.
+
+Your output MUST conform exactly to this schema:
+{
+  "summary": "2-3 sentence natural language description of the dominant pattern in this data",
+  "category_label": "short noun phrase, 3-6 words",
+  "confidence": 0.0-1.0,
+  "domain_distribution": {"domain_name": float},
+
+  "named_entities": [
+    {
+      "name": "string",
+      "type": "one of: Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity",
+      "description": "one sentence",
+      "role_in_category": "one of: trigger|outcome|context|modifier|co-occurrence"
+    }
+  ],
+
+  "named_relationships": [
+    {
+      "from": "entity name",
+      "relation": "one of: [TAXONOMY_LIST]",
+      "to": "entity name",
+      "confidence": 0.0-1.0,
+      "causal_direction": "A->B|B->A|bidirectional|unknown",
+      "avg_lead_time_days": null or float
+    }
+  ],
+
+  "temporal_signals": [
+    {
+      "entity": "entity name",
+      "signal_type": "duration|frequency|lead_time|recurrence|trend",
+      "value": "string",
+      "relative_to": "now|episode|other_entity"
+    }
+  ],
+
+  "predictions": [
+    {
+      "text": "string",
+      "confidence": 0.0-1.0,
+      "timeframe": "string"
+    }
+  ]
+}
+
+Rules:
+- Only use relationship types from the provided taxonomy
+- Skip relationships with confidence < 0.6
+- Max 15 entities, 20 relationships per response
+- Normalize entity names: title case, no duplicates within one response
+- If a pattern is unclear or data is too sparse: set confidence < 0.4
+```
+
+Replace `[TAXONOMY_LIST]` with the flat list from `taxonomy.py` at call time.
+
+**LLM call:**
+```python
+response = httpx.post(
+    f"{settings.litellm_base_url}/chat/completions",
+    headers={"Authorization": f"Bearer {settings.litellm_api_key}"},
+    json={
+        "model": settings.extract_model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": format_points_for_extraction(sampled_points)}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 2000,
+    },
+    timeout=60.0
+)
+```
+
+**Validation:** Parse response with Pydantic model matching the schema. On validation failure: log full response + error, increment attempt counter, skip. Do not pass unvalidated data downstream.
+
+**Retry:** exponential backoff — 1s, 2s, 4s, max 3 attempts, then dead-letter.
+
+### 6.5 Relationship Taxonomy
+
+```python
+RELATIONSHIP_TAXONOMY = {
+    "causal":        ["TRIGGERS", "CAUSES", "WORSENS", "IMPROVES", "PREVENTS", "RELIEVES"],
+    "temporal":      ["PRECEDES", "FOLLOWS", "COINCIDES_WITH", "PREDICTS", "CORRELATES_WITH"],
+    "transactional": ["PURCHASED", "CONSUMED", "USED", "AVOIDED"],
+    "social":        ["INTERACTED_WITH", "MENTIONED", "SUPPORTED_BY", "CONFLICTED_WITH"],
+    "categorical":   ["IS_TYPE_OF", "BELONGS_TO", "CATEGORIZED_AS", "ASSOCIATED_WITH"],
+    "health":        ["EXPERIENCED", "AGGRAVATED_BY", "RELIEVED_BY", "COMORBID_WITH"],
+    "behavioral":    ["PERFORMED", "ATTEMPTED", "HABITUAL_WITH", "REACTIVE_TO"],
+}
+
+FLAT_TAXONOMY = [r for rels in RELATIONSHIP_TAXONOMY.values() for r in rels]
+```
+
+**Normalization pass** (runs before any relationship is stored):
+```python
+def normalize_relationship(raw: str) -> str:
+    raw_upper = raw.upper().replace(" ", "_").replace("-", "_")
+    if raw_upper in FLAT_TAXONOMY:
+        return raw_upper
+    # embed raw string, find nearest taxonomy entry
+    scores = cosine_similarity(embed(raw), embed_all(FLAT_TAXONOMY))
+    best_idx = scores.argmax()
+    if scores[best_idx] >= 0.85:
+        return FLAT_TAXONOMY[best_idx]
+    # fallback
+    log_taxonomy_miss(raw, scores[best_idx])
+    return "ASSOCIATED_WITH"
+```
+
+### 6.6 Entity Registry — Canonical Identity
+
+For each named entity in the extraction output:
+
+```python
+def resolve_entity(name: str, type: str, description: str, user_id: str) -> dict:
+
+    # 1. check shared registry (vector search + levenshtein)
+    shared_hits = search_qdrant(
+        "shared_entity_registry",
+        query_vector=embed(f"{type}: {name}"),
+        limit=5, score_threshold=settings.dedup_similarity_threshold
+    )
+    shared_hits = [h for h in shared_hits
+                   if levenshtein(h.payload["canonical_name"].lower(), name.lower())
+                   <= settings.dedup_levenshtein_max
+                   or cosine_sim(embed(h.payload["canonical_name"]), embed(name)) >= settings.dedup_similarity_threshold]
+
+    if shared_hits:
+        shared_entity = shared_hits[0]
+        # add alias if name variant not already known
+        if name not in shared_entity.payload["aliases"]:
+            append_alias(shared_entity.id, name)
+        shared_id = shared_entity.id
+        canonical_name = shared_entity.payload["canonical_name"]
+    else:
+        # create in shared registry
+        shared_id = f"entity_{uuid4()}"
+        upsert_shared_entity(shared_id, name, type, description)
+        canonical_name = name
+
+    # 2. check personal registry
+    personal_hit = get_personal_entity(user_id, shared_id)
+
+    if personal_hit:
+        update_personal_entity_stats(user_id, shared_id)
+        personal_id = personal_hit.id
+    else:
+        personal_id = create_personal_entity(user_id, shared_id, canonical_name, type)
+
+    return {
+        "shared_entity_id": shared_id,
+        "personal_entity_id": personal_id,
+        "canonical_name": canonical_name
+    }
+```
+
+### 6.7 Category Versioning + Recurrence Detection
+
+Before creating a new memory category, check for an existing one:
+
+```python
+def find_matching_category(new_extraction: dict, user_id: str) -> str | None:
+    # embed the new summary
+    # search memory_{user_id}
+    hits = search_qdrant(
+        f"memory_{user_id}",
+        query_vector=embed(new_extraction["summary"]),
+        limit=5, score_threshold=settings.recurrence_similarity_threshold
+    )
+    for hit in hits:
+        # check entity overlap
+        existing_entities = {e["canonical_name"] for e in hit.payload["named_entities"]}
+        new_entities = {e["name"] for e in new_extraction["named_entities"]}
+        overlap = len(existing_entities & new_entities) / max(len(existing_entities | new_entities), 1)
+        if overlap >= settings.recurrence_entity_overlap_threshold:
+            return hit.id  # recurrence of this category
+    return None  # new category
+```
+
+**If recurrence detected:** add new version to existing category. Update `recurrence_count`, `cycles`, `avg_cycle_duration_days`, `avg_gap_between_cycles_days`. Recompute `predicted_resolution`.
+
+**If new category:** create with version 1.
+
+**Hash computation:**
+```python
+import hashlib, json
+
+def compute_category_hash(member_point_ids: list, embed_model: str) -> str:
+    content = json.dumps({
+        "ids": sorted(member_point_ids),
+        "embed_model": embed_model,
+    }, sort_keys=True)
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+```
+
+Only re-embed and re-upsert a category if the hash changed. Pass existing summary + new points for incremental updates, not full re-extraction.
+
+### 6.8 Prediction Lifecycle
+
+```python
+# predictor.py — runs every 6 hours via Celery beat
+
+def validate_predictions(user_id: str):
+    # get all PENDING predictions across all memory categories
+    pending = get_pending_predictions(user_id)
+
+    for pred in pending:
+        # check expiry
+        if days_since(pred.predicted_at) > settings.prediction_pending_expiry_days:
+            update_prediction_status(pred.id, "expired")
+            continue
+
+        # search recent raw_ingest for evidence
+        # embed prediction text, search raw_ingest_{uid} with recency filter
+        evidence = search_qdrant(
+            f"raw_ingest_{user_id}",
+            query_vector=embed(pred.text),
+            limit=5,
+            score_threshold=0.75,
+            filter={"timestamp": {"gte": pred.predicted_at}}
+        )
+
+        if evidence:
+            update_prediction_status(pred.id, "confirmed",
+                resolution_evidence=[e.id for e in evidence])
+            # confirmed predictions increase parent category confidence
+            increment_category_confidence(pred.category_id, delta=0.05)
+        # else: leave as PENDING until expiry
+```
+
+---
+
+## 7. Phase 6 — Retrieval Engine
+
+### 7.1 Query Classifier
+
+Before executing any retrieval, classify the query type. This determines the execution path.
+
+```python
+QUERY_TYPES = {
+    "current":       ["right now", "currently", "today", "am i", "what's happening"],
+    "retrospective": ["ago", "last week", "last month", "in january", "when did", "used to"],
+    "predictive":    ["will", "going to", "likely", "predict", "expect", "pattern suggests"],
+    "causal":        ["why", "what causes", "what triggers", "because of", "led to"],
+    "longitudinal":  ["over time", "trend", "changing", "getting better", "getting worse"],
+    "drill":         ["show me", "give me details", "more about", "what exactly"],
+}
+
+def classify_query(question: str) -> str:
+    question_lower = question.lower()
+    for qtype, signals in QUERY_TYPES.items():
+        if any(s in question_lower for s in signals):
+            return qtype
+    return "semantic"  # default: vector similarity
+```
+
+### 7.2 Retrieval Paths
+
+```python
+async def query(
+    question: str,
+    user_id: str,
+    top_k: int = 5,
+    domain_filter: str = None,
+    time_range: dict = None,
+    include_raw: bool = False,
+    drill_entity: str = None
+) -> RetrievalResult:
+
+    q_type = classify_query(question)
+    q_vector = embed(question)
+
+    if q_type == "current":
+        memory_hits = search_qdrant(
+            f"memory_{user_id}", q_vector, limit=top_k,
+            filter={"current_status": "active"}
+        )
+
+    elif q_type == "retrospective":
+        # extract time reference from question (regex or small LLM call)
+        time_window = extract_time_reference(question)
+        memory_hits = search_qdrant(
+            f"memory_{user_id}", q_vector, limit=top_k,
+            filter={"temporal.time_range.earliest": {"lte": time_window["end"]},
+                    "temporal.time_range.latest":   {"gte": time_window["start"]}}
+        )
+
+    elif q_type == "predictive":
+        memory_hits = search_qdrant(
+            f"memory_{user_id}", q_vector, limit=top_k,
+            filter={"predictions": {"status": "pending", "confidence": {"gte": 0.65}}}
+        )
+
+    elif q_type == "longitudinal":
+        # get all versions of matching categories
+        memory_hits = search_qdrant(f"memory_{user_id}", q_vector, limit=top_k)
+        # sort versions by timestamp within each hit
+
+    elif q_type == "causal":
+        # focus on named_relationships with causal types
+        memory_hits = search_qdrant(
+            f"memory_{user_id}", q_vector, limit=top_k * 2
+        )
+        memory_hits = filter_by_relationship_types(
+            memory_hits, ["TRIGGERS", "CAUSES", "WORSENS", "PRECEDES"]
+        )[:top_k]
+
+    else:  # semantic default
+        memory_hits = search_qdrant(f"memory_{user_id}", q_vector, limit=top_k)
+
+    # apply domain filter if provided
+    if domain_filter:
+        memory_hits = [h for h in memory_hits
+                       if h.payload["domain_distribution"].get(domain_filter, 0) >= 0.3]
+
+    # optional: drill into raw_ingest for source material
+    raw_hits = []
+    if include_raw:
+        raw_hits = search_qdrant(
+            f"raw_ingest_{user_id}", q_vector, limit=3,
+            filter={"memory_agent_seen": True}
+        )
+
+    # optional: multi-hop entity traversal
+    connected_categories = []
+    if drill_entity:
+        connected_categories = traverse_entity(drill_entity, user_id, hops=2)
+
+    return RetrievalResult(
+        query_type=q_type,
+        memory_categories=[format_memory_hit(h) for h in memory_hits],
+        connected_categories=connected_categories,
+        raw_snippets=[r.payload["raw_text"] for r in raw_hits],
+        drill_available=True,
+        user_id=user_id
+    )
+```
+
+### 7.3 Multi-hop Traversal (application-level, no graph DB)
+
+```python
+def traverse_entity(entity_name: str, user_id: str, hops: int = 2) -> list:
+    visited_categories = set()
+    frontier_entities = {entity_name}
+    results = []
+
+    for hop in range(hops):
+        # find categories containing any entity in frontier
+        new_categories = []
+        for entity in frontier_entities:
+            hits = search_qdrant(
+                f"memory_{user_id}",
+                query_vector=embed(entity),
+                limit=5
+            )
+            # filter to categories that actually name this entity
+            hits = [h for h in hits
+                    if any(e["canonical_name"] == entity
+                           for e in h.payload["named_entities"])]
+            new_categories.extend(hits)
+
+        # deduplicate
+        new_categories = [c for c in new_categories
+                          if c.id not in visited_categories]
+        visited_categories.update(c.id for c in new_categories)
+        results.extend(new_categories)
+
+        # expand frontier: collect all entities from new categories
+        frontier_entities = set()
+        for cat in new_categories:
+            for e in cat.payload["named_entities"]:
+                frontier_entities.add(e["canonical_name"])
+
+    return results
+```
+
+### 7.4 RetrievalResult Schema
+
+```python
+class RetrievalResult(BaseModel):
+    query_type: str
+    user_id: str
+    memory_categories: list[MemoryCategoryResult]
+    connected_categories: list[MemoryCategoryResult]
+    raw_snippets: list[str]
+    drill_available: bool
+    retrieved_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+class MemoryCategoryResult(BaseModel):
+    category_id: str
+    category_label: str
+    current_status: str
+    summary: str               # current version summary
+    confidence: float
+    named_entities: list       # with canonical names + roles
+    named_relationships: list  # with evidence counts
+    active_predictions: list   # status=pending only
+    temporal: dict             # full temporal block
+    domain_distribution: dict
+    recurrence_count: int
+    drill_entity_ids: list     # shared_entity_ids for drill-down
+```
+
+---
+
+## 8. Phase 7 — API
+
+```python
+# api/main.py — FastAPI
+
+POST /users/{user_id}                    # register new user, create collections
+DELETE /users/{user_id}                  # delete all user collections (with confirmation param)
+
+POST /ingest/{user_id}                   # upload file(s), returns job_id
+GET  /ingest/{user_id}/status            # queue depth, unprocessed count
+
+POST /query                              # main retrieval
+  body: {
+    question: str,
+    user_id: str,
+    top_k: int = 5,
+    domain_filter: str = null,
+    time_range: {start: ISO, end: ISO} = null,
+    include_raw: bool = false,
+    drill_entity: str = null
+  }
+
+GET  /memory/{user_id}                   # list all memory categories
+GET  /memory/{user_id}/{category_id}     # full category detail with all versions
+GET  /memory/{user_id}/active            # current_status=active only
+GET  /memory/{user_id}/predictions       # all pending predictions
+
+GET  /entities/{user_id}                 # list personal entity registry
+GET  /entities/shared                    # list shared entity registry
+
+GET  /status                             # system health
+  returns: {
+    services: {qdrant, redis, litellm},
+    users: [{user_id, raw_count, memory_count, entity_count}],
+    shared_entity_count: int,
+    agent_locks: {user_id: locked/free},
+    failed_ingest_count: int
+  }
+
+GET  /audit/taxonomy                     # relationship types not in taxonomy
+GET  /audit/coherence/{user_id}          # categories flagged for split/merge
+```
+
+---
+
+## 9. Hardening Requirements
+
+### 9.1 Embed Model Consistency
+
+On every collection write, verify embed model matches collection sentinel. If mismatch detected, STOP and report. Never write mismatched vectors.
+
+If embed model must be upgraded:
+1. Create new collections with `_v2` suffix
+2. Re-embed all points from old collection into new
+3. Verify point counts match
+4. Rename (or update config to point to new collections)
+5. Archive old collections, do not delete for 30 days
+
+### 9.2 Schema Drift Monitoring
+
+Weekly Celery task. Query Qdrant for relationship type values in memory collection payload. Compare against `FLAT_TAXONOMY`. Output to `./logs/schema_drift.log`:
+
+```
+SCHEMA DRIFT REPORT — 2025-01-15
+==================================
+unknown_relationship_types:
+  BOUGHT (n=14)          → suggest: PURCHASED
+  MADE_WORSE (n=7)       → suggest: WORSENS
+  HAD (n=31)             → suggest: EXPERIENCED
+
+unknown_entity_types:
+  Health_Issue (n=8)     → suggest: Condition
+  Trigger (n=4)          → suggest: Condition + role=trigger
+
+action_required: run backfill migration for types with n > 10
+```
+
+### 9.3 Backup
+
+Daily Celery task:
+
+```bash
+# Qdrant snapshot
+curl -X POST http://localhost:6333/collections/{name}/snapshots
+# copy snapshot files to ./backups/qdrant/YYYY-MM-DD/
+
+# Redis
+redis-cli BGSAVE
+cp /var/lib/redis/dump.rdb ./backups/redis/YYYY-MM-DD/
+
+# retain 30 days of backups, delete older
+```
+
+### 9.4 Migration System
+
+```python
+# migrations/runner.py
+# tracks executed migrations in a reserved Qdrant point
+# (id=0, collection=shared_entity_registry, payload.migrations=[...])
+# each migration file: numbered, has up() and is_applied() methods
+# runner checks is_applied() before executing
+# never re-runs applied migrations
+```
+
+### 9.5 LiteLLM Model Logging
+
+Log `model_used` on every LLM call result. Store in memory category payload:
+```json
+"extraction_meta": {
+  "model_used": "string",
+  "extraction_timestamp": "ISO-8601",
+  "prompt_tokens": 0,
+  "completion_tokens": 0
+}
+```
+
+Enables auditing which model produced which extractions if quality variance emerges across load-balanced models.
+
+---
+
+## 10. docker-compose.yml
+
+```yaml
+version: "3.9"
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333", "6334:6334"]
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+      - ./backups/qdrant:/qdrant/snapshots
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+
+  memory-worker:
+    build: .
+    command: celery -A memory_agent.tasks worker --beat -l info -c 2
+    depends_on: [qdrant, redis]
+    env_file: .env
+    volumes:
+      - ./drop:/app/drop
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    depends_on: [qdrant, redis]
+    env_file: .env
+    volumes:
+      - ./drop:/app/drop
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+# LiteLLM and llama.cpp are NOT in this compose file
+# They are assumed already running on the host
+# Configure LITELLM_BASE_URL in .env to point to them
+```
+
+---
+
+## 11. Adding a New User
+
+```python
+def register_user(user_id: str):
+    # validate user_id: alphanumeric + underscore only, max 32 chars
+    assert re.match(r'^[a-z0-9_]{1,32}$', user_id), "invalid user_id"
+
+    collections_to_create = [
+        f"raw_ingest_{user_id}",
+        f"memory_{user_id}",
+        f"entity_registry_{user_id}",
+    ]
+
+    for name in collections_to_create:
+        if not collection_exists(name):
+            create_collection(name, settings.embed_dim)
+            write_sentinel(name, settings.embed_model, settings.embed_dim)
+        else:
+            verify_sentinel(name, settings.embed_model, settings.embed_dim)
+
+    # create drop zone directory
+    os.makedirs(f"./drop/{user_id}/processed", exist_ok=True)
+    os.makedirs(f"./drop/{user_id}/failed", exist_ok=True)
+
+    # register memory agent for this user in Celery
+    register_agent_schedule(user_id)
+    
+    log(f"user {user_id} registered successfully")
+```
+
+---
+
+## 12. What This System Does NOT Do
+
+Be explicit with the agent about intentional non-goals:
+
+- **No generative responses.** The API returns structured data. The calling AI agent generates any natural language responses. This system retrieves; it does not narrate.
+- **No real-time streaming.** Ingest and memory agent are async background processes. Query is synchronous but returns cached/pre-computed memory, not live computation.
+- **No cross-user data access.** A query for `user_id=alice` never touches `user_id=bob` collections under any circumstances. No shared behavioral data. No aggregate analytics across users.
+- **No automatic deletion.** Raw ingest points are never deleted. Memory categories are versioned, not replaced. The system is append-only by design. Manual deletion only via explicit admin API call.
+- **No Neo4j.** Multi-hop traversal is handled in application code. If traversal requirements grow beyond 4 hops or performance degrades on large datasets, revisit this decision explicitly rather than adding Neo4j mid-build.
