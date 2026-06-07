@@ -1,8 +1,8 @@
 # Personal Memory System — Coding Agent Directive
-**Version:** 2.0  
+**Version:** 3.0  
 **Status:** Final  
 **Target:** Coding agent with filesystem, shell, and network access  
-**Runtime:** Private home server with local GPU(s), LiteLLM load balancer, llama.cpp backends
+**Runtime:** Private home server — Linux, RTX GPU cluster, Docker, systemd, LiteLLM, llama.cpp
 
 ---
 
@@ -12,85 +12,118 @@
 2. **Never overwrite existing data.** If a Qdrant collection exists with points, do not recreate it. If it has zero points, recreate only if schema is wrong.
 3. **Every write is idempotent.** Every task, every agent cycle, every upsert must be safe to re-run on the same data without side effects.
 4. **Fail loudly, degrade gracefully.** On any error: log it with full context, write to dead-letter, continue. Never silently swallow failures.
-5. **The system has two users of its output:** a human reading summaries, and an AI agent making programmatic queries. Both must be served. The `/query` endpoint returns structured data, not prose narration.
+5. **The system has two consumers of its output:** a human reading summaries, and an AI agent making programmatic queries. Both must be served. The `/query` endpoint returns structured data, not prose narration.
+6. **Epistemic boundaries are inviolable.** No layer may automatically write into another layer without explicit authorization. External data never enters autobiographical memory without explicit human action. Internal behavioral data never enters the shared registry.
+7. **Trends and predictions are mechanically distinct.** A trend is a mathematical measurement. A prediction is a probabilistic hypothesis. Never conflate them in code, schema, or prompts.
 
 ---
 
-## 1. Architecture Overview
+## 1. Epistemic Model — Provenance on Every Object
 
-```
-[ drop zone: ./drop/{user_id}/ ]
-          ↓
-[ ingest agent ]
-  - classify domain
-  - chunk + embed (local model)
-  - write to raw_ingest_{user_id}
-          ↓
-[ raw_ingest_{user_id} ]          ← per-user, never shared
-          ↓
-[ memory agent (per user) ]
-  - rotating sample strategies
-  - correlate + name entities
-  - check/update shared entity registry
-  - write/version memory_{user_id}
-  - validate predictions
-          ↓              ↓
-[ memory_{user_id} ]   [ entity_registry_{user_id} ]
-   versioned             personal layer over shared
-   longitudinal          canonical name + personal stats
-          ↓
-[ shared_entity_registry ]        ← shared across users
-   canonical names only            no behavioral data
-   alias resolution                no timestamps
-   normalization target            no co-occurrence
-          ↓
-[ /query?user={user_id} ]
-   structured RetrievalResult
-          ↓
-[ calling AI agent ]
-   use summary OR drill deeper
-```
-
-**Collections per user:** `raw_ingest_{uid}`, `memory_{uid}`, `entity_registry_{uid}`  
-**Shared collection:** `shared_entity_registry` (one, global)  
-**No graph database required.** Multi-hop traversal is handled in application code via two Qdrant searches with an in-memory join. Add Neo4j only if traversal depth regularly exceeds 4 hops or dataset exceeds personal scale.  
-**No separate compactor process.** The memory agent is the single intelligence layer. Entity naming happens inside its correlation step.
-
----
-
-## 2. Phase 1 — Environment Detection (MANDATORY FIRST)
-
-Run every check. Do not skip. Output the full report before proceeding.
-
-### 2.1 Services
+Every data object in the system must expose its provenance. This is not optional metadata — it is the trust foundation that prevents hallucination loops, enables agent auditing, and allows future multi-agent consensus networks to weight evidence correctly.
 
 ```python
-# Check each service. Record: RUNNING | ABSENT
-# If ABSENT: check for Docker. If Docker available: provide start command.
-# If Docker unavailable: provide manual install instructions.
-
-services = {
-    "qdrant":    {"host": "localhost", "port": 6333, "health": "/healthz"},
-    "redis":     {"host": "localhost", "port": 6379},  # required for distributed lock
-    "litellm":   {"host": "localhost", "port": 4000, "health": "/health"},  # or configured port
-}
+class ProvenanceTag(str, Enum):
+    OBSERVED    = "observed"     # directly from human first-person input
+    INFERRED    = "inferred"     # derived by memory agent from observed data
+    RETRIEVED   = "retrieved"    # fetched from external source by horizon scout
+    PREDICTED   = "predicted"    # mathematically extrapolated future hypothesis
+    CALCULATED  = "calculated"   # objective computation (trends, statistics)
 ```
 
-For LiteLLM specifically: if running, call `/models` and record which models are available. This determines which model handles extraction vs embedding.
+Every Qdrant point payload in every collection must include:
+```json
+"provenance": "observed|inferred|retrieved|predicted|calculated",
+"provenance_chain": ["source_id_1", "source_id_2"]
+```
 
-### 2.2 Runtime
+`provenance_chain` lists the point IDs that contributed to this object's creation. Raw ingest points have an empty chain. Memory categories list their member point IDs. Predictions list the memory category IDs they were derived from. This makes every inference chain traceable and auditable.
+
+---
+
+## 2. Architecture Overview — Cognitive Layer Stack
+
+The system is organized into strictly isolated cognitive layers. **No layer may automatically contaminate another.** Data flows down the stack only through explicit, authorized transitions.
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║  LAYER 0 — RAW INGEST                                           ║
+║  raw_ingest_{uid}                                               ║
+║  Provenance: OBSERVED                                           ║
+║  First-person baseline truth. Drop zone → parse → embed → store ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LAYER 1 — MEMORY                                               ║
+║  memory_{uid}                                                   ║
+║  Provenance: INFERRED                                           ║
+║  Versioned semantic categories derived from raw ingest only.    ║
+║  Longitudinal. Append-only. Never overwritten.                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LAYER 2 — TRENDS                                               ║
+║  entity_registry_{uid} (trend fields)                           ║
+║  Provenance: CALCULATED                                         ║
+║  Objective directional measurements. No confidence score.       ║
+║  Mathematical, not probabilistic.                               ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LAYER 3 — PREDICTIONS                                          ║
+║  predictions_{uid}                                              ║
+║  Provenance: PREDICTED                                          ║
+║  Probabilistic hypotheses with confidence scores.               ║
+║  Bayesian-weighted. Expire or resolve. Never permanent.         ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LAYER 4 — HORIZON SCAN  [SANDBOXED]                           ║
+║  horizon_scan_{uid}                                             ║
+║  Provenance: RETRIEVED                                          ║
+║  External world intelligence. Strictly quarantined.             ║
+║  CANNOT write to layers 0-3 automatically. Ever.               ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LAYER 5 — ALERTS                                               ║
+║  alerts_{uid}                                                   ║
+║  Provenance: RETRIEVED + CALCULATED                             ║
+║  High-priority operational interruptions only.                  ║
+║  Bypass queue. Strict criteria. Not a notification feed.        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+SHARED (cross-user, no behavioral data):
+  shared_entity_registry   canonical identity + aliases only
+```
+
+**Collections per user:** `raw_ingest_{uid}`, `memory_{uid}`, `entity_registry_{uid}`, `predictions_{uid}`, `horizon_scan_{uid}`, `alerts_{uid}`  
+**Shared:** `shared_entity_registry`  
+**No graph database.** Multi-hop traversal in application code. Revisit only if hops > 4 or dataset exceeds personal scale.  
+**No separate compactor.** Memory agent is the single intelligence layer.
+
+---
+
+## 3. Phase 1 — Environment Detection (MANDATORY FIRST)
+
+Run every check. Do not skip any. Output the full report. Do not proceed until complete.
+
+### 3.1 Services
+
+```python
+services = {
+    "qdrant":   {"host": "localhost", "port": 6333, "health": "/healthz"},
+    "redis":    {"host": "localhost", "port": 6379},
+    "litellm":  {"host": "localhost", "port": 4000, "health": "/health"},
+}
+# For each: RUNNING | ABSENT
+# If ABSENT + Docker available: provide exact docker run command
+# If ABSENT + no Docker: provide apt/pip install instructions
+# For LiteLLM if RUNNING: call /models, record all available model names
+# For llama.cpp: check configured port, record loaded model names + context sizes
+```
+
+### 3.2 Runtime
 
 ```
 - Python version (require >= 3.10)
-- Active virtualenv / conda env name
-- CUDA availability (nvidia-smi or torch.cuda.is_available())
-- GPU count and VRAM per GPU
-- llama.cpp: check if running, record endpoint and loaded models
+- Active virtualenv / conda env name and path
+- CUDA: run nvidia-smi, record GPU count, model, VRAM per GPU
+- systemd: check if any relevant services are managed (qdrant.service, redis.service)
+- llama.cpp: check endpoint, record loaded models and their context window sizes
 ```
 
-### 2.3 Python Packages
-
-Check for all of the following. Record version if present, MISSING if absent:
+### 3.3 Python Packages
 
 ```
 qdrant-client >= 1.7
@@ -102,37 +135,42 @@ pydantic-settings
 python-dotenv
 fastapi
 uvicorn
-watchdog          # file watcher for drop zone
-tiktoken          # chunking
-httpx             # async LiteLLM calls
+watchdog
+tiktoken
+httpx
 numpy
+pdfminer.six
+requests
 ```
 
-### 2.4 Existing Data
+### 3.4 Existing Data
 
 ```python
-# If Qdrant is running:
-# - List all collections
-# - For each collection matching known patterns:
-#   record: name, vector_dim, point_count, payload_schema_sample (first point)
-# - Detect existing users from collection naming pattern raw_ingest_{uid}
-
-# Check .env for:
-REQUIRED_VARS = [
-    "LITELLM_BASE_URL",      # e.g. http://localhost:4000
-    "LITELLM_API_KEY",       # even if local, LiteLLM may require one
-    "EMBED_MODEL",           # model name as LiteLLM knows it
-    "EXTRACT_MODEL",         # model name for entity extraction
+REQUIRED_ENV_VARS = [
+    "LITELLM_BASE_URL",
+    "LITELLM_API_KEY",
+    "EMBED_MODEL",
+    "EXTRACT_MODEL",
+    "SCOUT_MODEL",         # can be lighter model than extract
+    "GATEKEEPER_MODEL",    # relevance scoring model for horizon scout
     "REDIS_URL",
     "QDRANT_URL",
+    "OPERATOR_USER_ID",    # primary user, used to scope blast radius config
 ]
+
+# If Qdrant running:
+# - list all collections, record point counts and vector dims
+# - detect known users from collection naming patterns
+# - check for sentinel point (id=0) in each collection
+# - check for predictions_{uid}, horizon_scan_{uid}, alerts_{uid}
+#   (new in v3 — may be absent on existing deployments, create them)
 ```
 
-### 2.5 Detection Report Format
+### 3.5 Detection Report Format
 
 ```
 ========================================
-DETECTION REPORT
+DETECTION REPORT — v3.0
 ========================================
 timestamp:        ISO-8601
 
@@ -140,108 +178,125 @@ SERVICES
   qdrant:         RUNNING v1.x.x | ABSENT (docker: YES/NO)
   redis:          RUNNING | ABSENT (docker: YES/NO)
   litellm:        RUNNING at http://... | ABSENT
-  litellm_models: [list of available model names]
+  litellm_models: [list]
   llamacpp:       RUNNING at http://... | ABSENT
+  llamacpp_models: [name, context_size, ...]
 
 RUNTIME
   python:         3.x.x
   env:            venv @ /path | conda:name | system
-  cuda:           YES (N GPUs, Nx GB VRAM) | NO
-  llamacpp_model: [model names if running]
+  cuda:           YES (N GPUs: [model, VRAMgb], ...) | NO
+  systemd_units:  [list of relevant managed services]
 
 PACKAGES
   missing:        [list] | none
 
-ENVIRONMENT
-  LITELLM_BASE_URL:  SET | MISSING
-  LITELLM_API_KEY:   SET | MISSING
-  EMBED_MODEL:       value | MISSING
-  EXTRACT_MODEL:     value | MISSING
-  REDIS_URL:         SET | MISSING
-  QDRANT_URL:        SET | MISSING
+ENVIRONMENT VARS
+  LITELLM_BASE_URL:    SET | MISSING
+  LITELLM_API_KEY:     SET | MISSING
+  EMBED_MODEL:         value | MISSING
+  EXTRACT_MODEL:       value | MISSING
+  SCOUT_MODEL:         value | MISSING
+  GATEKEEPER_MODEL:    value | MISSING
+  REDIS_URL:           SET | MISSING
+  QDRANT_URL:          SET | MISSING
+  OPERATOR_USER_ID:    value | MISSING
 
-EXISTING DATA
-  collections:    [list with point counts and vector dims]
-  known_users:    [user_ids detected from collection names]
-  shared_registry: EXISTS (N points) | MISSING
+EXISTING COLLECTIONS
+  [name]: points=N, vector_dim=N, sentinel=VALID|MISSING|MISMATCH
+  new_required: [predictions_{uid}, horizon_scan_{uid}, alerts_{uid}]
 
-EMBED MODEL CONSISTENCY CHECK
+EMBED MODEL CONSISTENCY
   configured_dim:   N
-  existing_collections_dim: [name: N, ...]
-  conflict:         YES → STOP, report mismatch | NO
+  collection_dims:  [name: N, ...]
+  conflict:         YES → HARD STOP | NO
 
 ACTION PLAN
-  install:        [packages]
-  start:          [services]
-  create_collections: [names with configs]
-  create_env_vars: [missing vars]
-  proceed_to:     Phase 2
+  install:             [packages]
+  start:               [services]
+  create_collections:  [names]
+  missing_env_vars:    [list]
+  proceed_to:          Phase 2
 ========================================
 ```
 
-**STOP if:** embed model dimension conflicts with existing collections. Report the conflict. Do not proceed. Ask for resolution.
+**HARD STOP if:** embed model dimension conflicts with any existing collection. Report mismatch. Do not proceed. Ask operator for resolution before continuing.
 
 ---
 
-## 3. Phase 2 — Project Scaffold
+## 4. Phase 2 — Project Scaffold
 
-### 3.1 Directory Structure
+### 4.1 Directory Structure
 
 ```
 personal-memory/
 ├── .env.example
-├── .env                        # never commit
-├── docker-compose.yml          # qdrant + redis only
+├── .env
+├── docker-compose.yml
 ├── requirements.txt
-├── config.py                   # Pydantic Settings
-├── collections.py              # collection configs, creation, validation
+├── config.py
+├── collections.py
+├── provenance.py               # ProvenanceTag enum + chain utilities
 ├── ingest/
 │   ├── __init__.py
-│   ├── classifier.py           # lightweight domain tagger
-│   ├── chunker.py              # chunk + embed raw text
-│   ├── loader.py               # file parser per type
-│   └── watcher.py              # watchdog drop zone monitor
+│   ├── classifier.py
+│   ├── chunker.py
+│   ├── loader.py
+│   └── watcher.py
 ├── memory_agent/
 │   ├── __init__.py
-│   ├── agent.py                # main cycle orchestrator
-│   ├── sampler.py              # rotating sample strategies
-│   ├── correlator.py           # LLM correlation + entity naming
-│   ├── taxonomy.py             # relationship vocabulary + normalizer
-│   ├── entity_registry.py      # canonical entity lookup + dedup
-│   ├── versioner.py            # category versioning + recurrence detection
-│   ├── predictor.py            # prediction lifecycle management
-│   └── tasks.py                # Celery tasks + beat schedule
+│   ├── agent.py
+│   ├── sampler.py
+│   ├── correlator.py
+│   ├── taxonomy.py
+│   ├── entity_registry.py
+│   ├── versioner.py
+│   ├── trend_calculator.py     # NEW: objective trend math, no LLM
+│   ├── predictor.py            # NEW: prediction lifecycle + Bayesian scorer
+│   └── tasks.py
+├── horizon/
+│   ├── __init__.py
+│   ├── scout.py                # NEW: weekly entity-driven search
+│   ├── gatekeeper.py           # NEW: two-tier relevance + urgency evaluator
+│   ├── blast_radius.py         # NEW: operational context config
+│   └── tasks.py                # NEW: scout Celery tasks
 ├── retrieval/
 │   ├── __init__.py
-│   ├── engine.py               # query routing + dual-layer retrieval
-│   └── drill.py                # drill-down helpers
+│   ├── engine.py
+│   └── drill.py
 ├── api/
 │   ├── __init__.py
-│   └── main.py                 # FastAPI
+│   └── main.py
 ├── migrations/
 │   ├── __init__.py
-│   ├── runner.py               # migration executor
-│   └── 001_initial_collections.py
+│   ├── runner.py
+│   ├── 001_initial_collections.py
+│   └── 002_add_predictions_horizon_alerts.py
 └── tests/
     ├── test_detection.py
     ├── test_ingest.py
     ├── test_memory_agent.py
+    ├── test_trends.py
+    ├── test_predictor.py
+    ├── test_horizon_scout.py
     └── test_retrieval.py
 ```
 
-### 3.2 config.py
+### 4.2 config.py
 
 ```python
 from pydantic_settings import BaseSettings
 from typing import Literal
 
 class Settings(BaseSettings):
-    # LiteLLM (unified local endpoint)
+    # LiteLLM
     litellm_base_url: str = "http://localhost:4000"
     litellm_api_key: str = "local"
-    extract_model: str          # must be set in .env
-    embed_model: str            # must be set in .env
-    embed_dim: int = 384        # must match embed_model output
+    extract_model: str
+    embed_model: str
+    embed_dim: int = 384
+    scout_model: str             # can be lighter/faster than extract_model
+    gatekeeper_model: str        # relevance + urgency evaluator
 
     # Infrastructure
     qdrant_url: str = "http://localhost:6333"
@@ -255,26 +310,36 @@ class Settings(BaseSettings):
 
     # Memory agent
     sample_batch_size: int = 50
-    sample_strategies: list = [
-        "temporal_window",
-        "semantic_cluster",
-        "cross_domain",
-        "recent_unseen",
-        "entity_neighborhood"
-    ]
     agent_interval_seconds: int = 300
-    category_coherence_threshold: float = 0.65   # below = flag for split
-    category_merge_threshold: float = 0.92        # above = flag for merge
+    category_coherence_threshold: float = 0.65
+    category_merge_threshold: float = 0.92
     recurrence_similarity_threshold: float = 0.80
     recurrence_entity_overlap_threshold: float = 0.60
-    prediction_pending_expiry_days: int = 30
 
-    # Entity registry
-    dedup_similarity_threshold: float = 0.88
-    dedup_levenshtein_max: int = 2
+    # Trends
+    trend_min_observations: int = 5       # minimum points before trend is meaningful
+    trend_volatility_cv_threshold: float = 0.3  # coefficient of variation above = volatile
+
+    # Predictions
+    prediction_pending_expiry_days: int = 30
+    prediction_confirmation_threshold: float = 0.75
+    prediction_decay_halflife_days: int = 7   # weight halves every N days without evidence
+
+    # Horizon scout
+    scout_interval_days: int = 7
+    scout_top_entities: int = 10          # highest trending entities to generate queries from
+    scout_lookback_days: int = 7          # only retrieve external events from last N days
+    scout_relevance_threshold: float = 0.75
+    scout_max_results_per_query: int = 20
+
+    # Blast radius — operator-specific (set in .env)
+    operator_user_id: str
+    operator_geography: str = "Chula Vista, San Diego, CA"
+    operator_infrastructure: str = "Linux, RTX GPU, Docker, systemd, Python, llama.cpp"
+    operator_family_dependencies: str = ""   # optional, affects alert criteria
 
     # Redis lock
-    lock_ttl_seconds: int = 240   # 4 min; compactor cycle < this
+    lock_ttl_seconds: int = 240
 
     class Config:
         env_file = ".env"
@@ -282,37 +347,51 @@ class Settings(BaseSettings):
 
 ---
 
-## 4. Phase 3 — Collections
+## 5. Phase 3 — Collections
 
-### 4.1 Collection Definitions
-
-All collections use the same vector dimension (`settings.embed_dim`). **Never mix dimensions in one collection.** On first run, record `embed_model` and `embed_dim` in a `_meta` payload on a special sentinel point (id=0) in each collection. On subsequent runs, verify sentinel matches config before writing.
+### 5.1 All Collection Definitions
 
 ```python
-COLLECTIONS = {
-    # Per-user (created on first user registration)
-    "raw_ingest_{uid}": {
-        "vector_dim": settings.embed_dim,
-        "distance": "Cosine",
-        "on_disk_payload": True,
-    },
-    "memory_{uid}": {
-        "vector_dim": settings.embed_dim,
-        "distance": "Cosine",
-    },
-    "entity_registry_{uid}": {
-        "vector_dim": settings.embed_dim,
-        "distance": "Cosine",
-    },
-    # Shared (created once globally)
-    "shared_entity_registry": {
-        "vector_dim": settings.embed_dim,
-        "distance": "Cosine",
-    },
+# Per-user collections (created on user registration)
+PER_USER_COLLECTIONS = [
+    "raw_ingest_{uid}",
+    "memory_{uid}",
+    "entity_registry_{uid}",
+    "predictions_{uid}",       # NEW: dedicated prediction objects
+    "horizon_scan_{uid}",      # NEW: sandboxed external intelligence
+    "alerts_{uid}",            # NEW: bypass-escalation objects
+]
+
+# Shared (global, one instance)
+SHARED_COLLECTIONS = [
+    "shared_entity_registry",
+]
+
+# All use identical vector config
+COLLECTION_CONFIG = {
+    "vector_dim": settings.embed_dim,
+    "distance": "Cosine",
+    "on_disk_payload": True,   # raw_ingest can be large; persist payload to disk
 }
 ```
 
-### 4.2 Point Schemas
+Every collection gets a sentinel point at id=0 on creation:
+```json
+{
+  "id": 0,
+  "vector": [0.0, ...],
+  "payload": {
+    "_sentinel": true,
+    "embed_model": "model-name",
+    "embed_dim": 384,
+    "collection_purpose": "raw_ingest|memory|entity_registry|predictions|horizon_scan|alerts|shared_entity_registry",
+    "schema_version": 1,
+    "created_at": "ISO-8601"
+  }
+}
+```
+
+### 5.2 Point Schemas
 
 **raw_ingest_{uid}**
 ```json
@@ -321,8 +400,8 @@ COLLECTIONS = {
   "vector": [],
   "payload": {
     "raw_text": "string",
-    "source_type": "journal|finance|transcript|note|health|sleep|other",
-    "domain": "health|finance|social|nutrition|sleep|cognitive|environment",
+    "source_type": "journal|finance|transcript|note|health|sleep|infrastructure|other",
+    "domain": "health|finance|social|nutrition|sleep|cognitive|environment|infrastructure",
     "sub_domain": "string",
     "domain_confidence": 0.0,
     "source_path": "string",
@@ -335,8 +414,9 @@ COLLECTIONS = {
     "week_of_year": 0,
     "time_of_day_bucket": "morning|afternoon|evening|night",
     "year_month": "YYYY-MM",
-    "processed": false,
-    "processing_attempts": 0,
+    "memory_agent_seen": false,
+    "provenance": "observed",
+    "provenance_chain": [],
     "embed_model": "string",
     "embed_model_version": "string"
   }
@@ -355,6 +435,8 @@ COLLECTIONS = {
     "flagged_for": null,
     "coherence_score": 0.0,
     "overlap_score": 0.0,
+    "provenance": "inferred",
+    "provenance_chain": ["raw_point_id_1", "raw_point_id_2"],
 
     "current_version": 1,
     "versions": [
@@ -367,7 +449,13 @@ COLLECTIONS = {
         "confidence": 0.0,
         "status": "active|resolved",
         "sampling_strategy": "string",
-        "hash": "string"
+        "hash": "string",
+        "extraction_meta": {
+          "model_used": "string",
+          "extraction_timestamp": "ISO-8601",
+          "prompt_tokens": 0,
+          "completion_tokens": 0
+        }
       }
     ],
 
@@ -392,18 +480,6 @@ COLLECTIONS = {
         "confidence": 0.0,
         "evidence_count": 0,
         "causal_direction": "A->B|B->A|bidirectional|unknown"
-      }
-    ],
-
-    "predictions": [
-      {
-        "prediction_id": "pred_{uuid}",
-        "text": "string",
-        "confidence": 0.0,
-        "status": "pending|confirmed|refuted|expired",
-        "predicted_at": "ISO-8601",
-        "resolved_at": null,
-        "resolution_evidence": null
       }
     ],
 
@@ -450,11 +526,100 @@ COLLECTIONS = {
     "last_seen": "ISO-8601",
     "last_gap_days": 0,
     "mention_count": 0,
-    "avg_interval_days": null,
-    "trend": "increasing|decreasing|stable|volatile|unknown",
     "occurrence_timestamps": [],
     "co_occurrence_scores": {},
-    "appears_in_categories": []
+    "appears_in_categories": [],
+    "provenance": "inferred",
+
+    "trend": {
+      "direction": "increasing|decreasing|stable|volatile|insufficient_data",
+      "slope": 0.0,
+      "coefficient_of_variation": 0.0,
+      "observation_count": 0,
+      "last_calculated": "ISO-8601",
+      "provenance": "calculated"
+    }
+  }
+}
+```
+
+**predictions_{uid}** — dedicated collection, not embedded in memory points
+```json
+{
+  "id": "pred_{uuid}",
+  "vector": [],
+  "payload": {
+    "prediction_id": "pred_{uuid}",
+    "text": "string",
+    "source_category_id": "memory_{uuid}",
+    "source_entity": "string",
+    "source_trend_direction": "increasing|decreasing|stable|volatile",
+    "initial_confidence": 0.0,
+    "current_weight": 0.0,
+    "peak_weight": 0.0,
+    "status": "pending|confirmed|refuted|expired|dormant",
+    "timeframe": "string",
+    "predicted_at": "ISO-8601",
+    "last_scored_at": "ISO-8601",
+    "resolved_at": null,
+    "resolution_evidence_ids": [],
+    "confirming_evidence_count": 0,
+    "refuting_evidence_count": 0,
+    "decay_rate": 0.0,
+    "provenance": "predicted",
+    "provenance_chain": ["memory_{uuid}", "entity_{uuid}"]
+  }
+}
+```
+
+**horizon_scan_{uid}** — sandboxed, never auto-promoted to memory
+```json
+{
+  "id": "scan_{uuid}",
+  "vector": [],
+  "payload": {
+    "scan_id": "scan_{uuid}",
+    "title": "string",
+    "summary": "string",
+    "source_url": "string",
+    "source_domain": "string",
+    "retrieved_at": "ISO-8601",
+    "event_date": "ISO-8601",
+    "relevance_score": 0.0,
+    "urgency_score": 0.0,
+    "requires_immediate_bypass": false,
+    "triggering_entities": [],
+    "search_query_used": "string",
+    "status": "new|delivered|dismissed|internalized",
+    "internalized_at": null,
+    "internalized_by": "explicit_human_action",
+    "provenance": "retrieved",
+    "provenance_chain": []
+  }
+}
+```
+
+**alerts_{uid}** — bypass escalations only
+```json
+{
+  "id": "alert_{uuid}",
+  "vector": [],
+  "payload": {
+    "alert_id": "alert_{uuid}",
+    "scan_id": "scan_{uuid}",
+    "alert_type": "physical_safety|infrastructure_death",
+    "severity": "critical|high",
+    "title": "string",
+    "summary": "string",
+    "affected_geography": "string",
+    "affected_infrastructure": [],
+    "source_url": "string",
+    "triggered_at": "ISO-8601",
+    "delivered_at": null,
+    "acknowledged_at": null,
+    "status": "pending|delivered|acknowledged",
+    "provenance": "retrieved",
+    "requires_immediate_bypass": true
   }
 }
 ```
@@ -466,44 +631,39 @@ COLLECTIONS = {
   "vector": [],
   "payload": {
     "canonical_name": "string",
-    "type": "Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity",
+    "type": "Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity|Infrastructure",
     "aliases": [],
     "description": "string",
     "created_at": "ISO-8601",
-    "last_updated": "ISO-8601"
+    "last_updated": "ISO-8601",
+    "provenance": "inferred"
   }
 }
 ```
 
-Note: shared registry contains NO behavioral data, NO timestamps from user activity, NO co-occurrence data, NO mention counts. Only canonical identity.
-
 ---
 
-## 5. Phase 4 — Ingest Agent
+## 6. Phase 4 — Ingest Agent
 
-### 5.1 File Watcher
+### 6.1 File Watcher
 
 ```python
 # watchdog monitors ./drop/{user_id}/ recursively
 # on CREATE event for supported extension:
-#   1. read + parse file (by extension)
-#   2. classify domain
-#   3. chunk
-#   4. embed each chunk
-#   5. write to raw_ingest_{user_id}
-#   6. move file to ./drop/{user_id}/processed/{filename}
-#     (never delete, never leave in place — prevents re-ingest on restart)
+#   1. parse file by extension
+#   2. classify domain (local model, no LLM)
+#   3. derive temporal fields at write time
+#   4. chunk at settings.chunk_size_tokens with overlap
+#   5. embed each chunk (LiteLLM embed endpoint)
+#   6. write to raw_ingest_{user_id} with provenance=observed
+#   7. move to ./drop/{user_id}/processed/{filename}
+#      NEVER delete. NEVER leave in place (prevents re-ingest on restart).
+#      NEVER move to processed until Qdrant write confirmed.
 ```
 
-Supported parsers:
-- `.txt`, `.md` → read directly
-- `.json` → stringify or extract text fields (try `content`, `text`, `body`, `note` keys)
-- `.csv` → row-by-row, each row is a chunk candidate; respect `chunk_size_tokens` limit
-- `.pdf` → extract text with `pdfminer.six`; fall back to OCR warning if text extraction yields < 100 chars
+### 6.2 Domain Classifier
 
-### 5.2 Domain Classifier
-
-**Do not use an LLM for this.** Use a local zero-shot classifier (`sentence-transformers` with NLI model) or a keyword/regex rule set. This runs on every ingest — it must be fast and never block.
+Do not use an LLM. Use local zero-shot NLI classifier (`sentence-transformers`) or keyword/regex rules. Must be fast — runs on every ingest point.
 
 ```python
 DOMAIN_LABELS = [
@@ -515,21 +675,19 @@ DOMAIN_LABELS = [
     "mood and mental state",
     "physical activity and exercise",
     "environment and location",
+    "infrastructure and technology systems",  # NEW: covers server logs, security events
 ]
-
-# classify → pick top label → map to domain enum
-# store confidence score
-# if confidence < 0.5: domain = "other", flag for review
+# if confidence < 0.5: domain = "other", flag payload
 ```
 
-### 5.3 Temporal Derivation
+### 6.3 Temporal Derivation
 
-Derive and store at write time. Never compute at query time.
+Compute at write time. Never at query time.
 
 ```python
 def derive_temporal(timestamp: datetime) -> dict:
     return {
-        "day_of_week": timestamp.weekday(),        # 0=Monday
+        "day_of_week": timestamp.weekday(),
         "week_of_year": timestamp.isocalendar()[1],
         "year_month": timestamp.strftime("%Y-%m"),
         "time_of_day_bucket": (
@@ -541,152 +699,116 @@ def derive_temporal(timestamp: datetime) -> dict:
     }
 ```
 
-### 5.4 Chunking
+### 6.4 Chunking
 
 ```python
-# use tiktoken for token counting
-# chunk at settings.chunk_size_tokens with settings.chunk_overlap_tokens overlap
-# each chunk stores:
-#   chunk_index: int (0-based)
-#   chunk_total: int
-#   parent_source_id: uuid (shared across all chunks of same file)
-# embed text: f"{domain} {sub_domain}: {chunk_text}"
-#   prepending domain improves semantic clustering
-```
-
-### 5.5 Dead Letter
-
-On any write failure:
-```python
-# append to ./logs/failed_ingest.jsonl
-{
-  "timestamp": "ISO-8601",
-  "user_id": "string",
-  "source_path": "string",
-  "error": "string",
-  "traceback": "string",
-  "payload_preview": "first 200 chars"
-}
+# embed text format: f"{domain} {sub_domain}: {chunk_text}"
+# prepending domain improves semantic clustering
+# store chunk_index, chunk_total, parent_source_id on every chunk
 ```
 
 ---
 
-## 6. Phase 5 — Memory Agent
+## 7. Phase 5 — Memory Agent
 
-### 6.1 Celery Beat Schedule
+### 7.1 Celery Beat Schedule
 
 ```python
-# tasks.py
-from celery import Celery
-from celery.schedules import timedelta
-
-app = Celery('memory', broker=settings.redis_url)
-
 app.conf.beat_schedule = {
-    'memory-agent-cycle': {
+    'memory-agent-{uid}': {
         'task': 'memory_agent.tasks.run_memory_cycle',
         'schedule': timedelta(seconds=settings.agent_interval_seconds),
+        'args': [user_id],
     },
-    'prediction-validator': {
-        'task': 'memory_agent.tasks.validate_predictions',
+    'trend-calculator-{uid}': {
+        'task': 'memory_agent.tasks.calculate_trends',
         'schedule': timedelta(hours=6),
+        'args': [user_id],
     },
-    'coherence-audit': {
-        'task': 'memory_agent.tasks.audit_category_coherence',
+    'prediction-scorer-{uid}': {
+        'task': 'memory_agent.tasks.score_predictions',
+        'schedule': timedelta(hours=6),
+        'args': [user_id],
+    },
+    'horizon-scout-{uid}': {
+        'task': 'horizon.tasks.run_scout_cycle',
+        'schedule': timedelta(days=settings.scout_interval_days),
+        'args': [user_id],
+    },
+    'schema-drift-audit': {
+        'task': 'memory_agent.tasks.audit_schema_drift',
+        'schedule': timedelta(days=7),
+    },
+    'coherence-audit-{uid}': {
+        'task': 'memory_agent.tasks.audit_coherence',
+        'schedule': timedelta(hours=24),
+        'args': [user_id],
+    },
+    'backup-daily': {
+        'task': 'memory_agent.tasks.run_backup',
         'schedule': timedelta(hours=24),
     },
 }
 ```
 
-### 6.2 Distributed Lock
+### 7.2 Distributed Lock
 
 ```python
-import redis
-import time
-
-def acquire_lock(r: redis.Redis, user_id: str) -> bool:
-    key = f"memory_agent_lock:{user_id}"
-    # NX = only set if not exists, EX = TTL in seconds
+def acquire_lock(r: redis.Redis, user_id: str, task: str) -> bool:
+    key = f"memory_lock:{task}:{user_id}"
     return r.set(key, "1", nx=True, ex=settings.lock_ttl_seconds)
-
-def release_lock(r: redis.Redis, user_id: str):
-    r.delete(f"memory_agent_lock:{user_id}")
+    # TTL = 240s. If agent crashes, lock auto-releases.
+    # Without TTL, a crash causes permanent deadlock.
 ```
 
-Always wrap the full agent cycle in lock acquire/release. If acquire returns False, skip cycle and log.
+### 7.3 Sampling Strategies
 
-### 6.3 Sampling Strategies
-
-The agent rotates through strategies. Track `last_strategy_used` in a Redis key per user. On each cycle, pick the next strategy in rotation.
+Track `last_strategy_used_{uid}` in Redis. Rotate deterministically.
 
 ```python
-strategies = {
-
-    "temporal_window": lambda: scroll_qdrant(
-        collection=f"raw_ingest_{uid}",
-        filter={"year_month": current_or_recent_month()},
-        limit=50, randomize=True
-    ),
-
-    "semantic_cluster": lambda: (
-        seed := random_point(f"raw_ingest_{uid}"),
-        search_qdrant(f"raw_ingest_{uid}", seed.vector, limit=50)
-    ),
-
-    "cross_domain": lambda: flatten([
-        scroll_qdrant(f"raw_ingest_{uid}",
-                      filter={"domain": d}, limit=10, randomize=True)
-        for d in random.sample(DOMAIN_LABELS, 5)
-    ]),
-
-    "recent_unseen": lambda: scroll_qdrant(
-        collection=f"raw_ingest_{uid}",
-        filter={"processed": False},
-        limit=50, order_by="timestamp desc"
-    ),
-    # note: 'processed' here means 'seen by memory agent'
-    # separate flag from ingest processed flag
-    # use payload field: memory_agent_seen: bool
-
-    "entity_neighborhood": lambda: (
-        entity := random_entity(f"entity_registry_{uid}"),
-        scroll_qdrant(f"raw_ingest_{uid}",
-                      filter={"entities_mentioned": entity.canonical_name},
-                      limit=50)
-    ),
+STRATEGIES = {
+    "temporal_window": ...,       # 50 points from same 2-week window
+    "semantic_cluster": ...,      # 50 nearest to random seed point
+    "cross_domain": ...,          # 10 points × 5 random domains
+    "recent_unseen": ...,         # 50 oldest memory_agent_seen=false
+    "entity_neighborhood": ...,   # 50 points referencing a random entity
 }
+# Group results by parent_source_id before sending to LLM.
+# Sibling chunks from the same document are sent together.
+# This prevents contradictory entity sets from the same source.
 ```
 
-### 6.4 Correlation + Entity Naming (LiteLLM Call)
+### 7.4 Extraction Prompt
 
-Group sampled points by `parent_source_id` before sending to LLM. Points sharing a parent are siblings from the same document — send them together as one extraction unit, not separately. This prevents contradictory entity sets from the same source.
+Temperature: 0.2. Validate all responses with Pydantic before writing. On validation failure: log + dead-letter + skip.
 
-**System prompt:**
 ```
+SYSTEM:
 You analyze personal life data and extract structured patterns.
-Return ONLY valid JSON. No preamble, no markdown fences, no commentary.
+Return ONLY valid JSON matching the schema exactly.
+No preamble. No markdown. No commentary.
 
-Your output MUST conform exactly to this schema:
+Schema:
 {
-  "summary": "2-3 sentence natural language description of the dominant pattern in this data",
-  "category_label": "short noun phrase, 3-6 words",
+  "summary": "2-3 sentence description of dominant pattern",
+  "category_label": "short noun phrase 3-6 words",
   "confidence": 0.0-1.0,
-  "domain_distribution": {"domain_name": float},
+  "domain_distribution": {"domain": float},
 
   "named_entities": [
     {
-      "name": "string",
-      "type": "one of: Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity",
-      "description": "one sentence",
-      "role_in_category": "one of: trigger|outcome|context|modifier|co-occurrence"
+      "name": str,
+      "type": "Person|Place|Event|Condition|Food|Purchase|Concept|Organization|Symptom|Medication|Activity|Infrastructure",
+      "description": str,
+      "role_in_category": "trigger|outcome|context|modifier|co-occurrence"
     }
   ],
 
   "named_relationships": [
     {
-      "from": "entity name",
-      "relation": "one of: [TAXONOMY_LIST]",
-      "to": "entity name",
+      "from": str,
+      "relation": "[TAXONOMY_LIST]",
+      "to": str,
       "confidence": 0.0-1.0,
       "causal_direction": "A->B|B->A|bidirectional|unknown",
       "avg_lead_time_days": null or float
@@ -695,55 +817,26 @@ Your output MUST conform exactly to this schema:
 
   "temporal_signals": [
     {
-      "entity": "entity name",
+      "entity": str,
       "signal_type": "duration|frequency|lead_time|recurrence|trend",
-      "value": "string",
+      "value": str,
       "relative_to": "now|episode|other_entity"
-    }
-  ],
-
-  "predictions": [
-    {
-      "text": "string",
-      "confidence": 0.0-1.0,
-      "timeframe": "string"
     }
   ]
 }
 
 Rules:
-- Only use relationship types from the provided taxonomy
-- Skip relationships with confidence < 0.6
-- Max 15 entities, 20 relationships per response
-- Normalize entity names: title case, no duplicates within one response
-- If a pattern is unclear or data is too sparse: set confidence < 0.4
+- Only use relationship types from the provided taxonomy list
+- Skip relationships confidence < 0.6
+- Max 15 entities, 20 relationships
+- Normalize entity names: title case, no duplicates in one response
+- confidence < 0.4 if data is sparse or pattern is unclear
+- DO NOT generate predictions here. Predictions are computed separately.
 ```
 
-Replace `[TAXONOMY_LIST]` with the flat list from `taxonomy.py` at call time.
+Note: predictions are not extracted by the LLM. They are computed mathematically by the predictor from trends. See Section 8.
 
-**LLM call:**
-```python
-response = httpx.post(
-    f"{settings.litellm_base_url}/chat/completions",
-    headers={"Authorization": f"Bearer {settings.litellm_api_key}"},
-    json={
-        "model": settings.extract_model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": format_points_for_extraction(sampled_points)}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 2000,
-    },
-    timeout=60.0
-)
-```
-
-**Validation:** Parse response with Pydantic model matching the schema. On validation failure: log full response + error, increment attempt counter, skip. Do not pass unvalidated data downstream.
-
-**Retry:** exponential backoff — 1s, 2s, 4s, max 3 attempts, then dead-letter.
-
-### 6.5 Relationship Taxonomy
+### 7.5 Relationship Taxonomy
 
 ```python
 RELATIONSHIP_TAXONOMY = {
@@ -754,175 +847,425 @@ RELATIONSHIP_TAXONOMY = {
     "categorical":   ["IS_TYPE_OF", "BELONGS_TO", "CATEGORIZED_AS", "ASSOCIATED_WITH"],
     "health":        ["EXPERIENCED", "AGGRAVATED_BY", "RELIEVED_BY", "COMORBID_WITH"],
     "behavioral":    ["PERFORMED", "ATTEMPTED", "HABITUAL_WITH", "REACTIVE_TO"],
+    "infrastructure":["DEPENDS_ON", "MONITORS", "EXPOSES", "PATCHES", "COMPROMISES"],
 }
-
 FLAT_TAXONOMY = [r for rels in RELATIONSHIP_TAXONOMY.values() for r in rels]
 ```
 
-**Normalization pass** (runs before any relationship is stored):
+Normalization: embed unknown relation string → cosine similarity against taxonomy → if >= 0.85 map to nearest → else use `ASSOCIATED_WITH` and log to `schema_drift.log`.
+
+### 7.6 Entity Registry — Canonical Identity
+
 ```python
-def normalize_relationship(raw: str) -> str:
-    raw_upper = raw.upper().replace(" ", "_").replace("-", "_")
-    if raw_upper in FLAT_TAXONOMY:
-        return raw_upper
-    # embed raw string, find nearest taxonomy entry
-    scores = cosine_similarity(embed(raw), embed_all(FLAT_TAXONOMY))
-    best_idx = scores.argmax()
-    if scores[best_idx] >= 0.85:
-        return FLAT_TAXONOMY[best_idx]
-    # fallback
-    log_taxonomy_miss(raw, scores[best_idx])
-    return "ASSOCIATED_WITH"
+def resolve_entity(name, type, description, user_id) -> dict:
+    # 1. check shared registry: vector search + levenshtein
+    # 2. if match: use canonical name, append alias if new variant
+    # 3. if no match: create new shared entity, generate UUID
+    # 4. check personal registry for this user
+    # 5. if exists: update stats (mention_count, last_seen, occurrence_timestamps)
+    # 6. if absent: create personal entity linking to shared UUID
+    # return: {shared_entity_id, personal_entity_id, canonical_name}
 ```
 
-### 6.6 Entity Registry — Canonical Identity
+Dedup thresholds: cosine similarity >= `settings.dedup_similarity_threshold` (0.88) OR levenshtein distance <= `settings.dedup_levenshtein_max` (2).
 
-For each named entity in the extraction output:
-
-```python
-def resolve_entity(name: str, type: str, description: str, user_id: str) -> dict:
-
-    # 1. check shared registry (vector search + levenshtein)
-    shared_hits = search_qdrant(
-        "shared_entity_registry",
-        query_vector=embed(f"{type}: {name}"),
-        limit=5, score_threshold=settings.dedup_similarity_threshold
-    )
-    shared_hits = [h for h in shared_hits
-                   if levenshtein(h.payload["canonical_name"].lower(), name.lower())
-                   <= settings.dedup_levenshtein_max
-                   or cosine_sim(embed(h.payload["canonical_name"]), embed(name)) >= settings.dedup_similarity_threshold]
-
-    if shared_hits:
-        shared_entity = shared_hits[0]
-        # add alias if name variant not already known
-        if name not in shared_entity.payload["aliases"]:
-            append_alias(shared_entity.id, name)
-        shared_id = shared_entity.id
-        canonical_name = shared_entity.payload["canonical_name"]
-    else:
-        # create in shared registry
-        shared_id = f"entity_{uuid4()}"
-        upsert_shared_entity(shared_id, name, type, description)
-        canonical_name = name
-
-    # 2. check personal registry
-    personal_hit = get_personal_entity(user_id, shared_id)
-
-    if personal_hit:
-        update_personal_entity_stats(user_id, shared_id)
-        personal_id = personal_hit.id
-    else:
-        personal_id = create_personal_entity(user_id, shared_id, canonical_name, type)
-
-    return {
-        "shared_entity_id": shared_id,
-        "personal_entity_id": personal_id,
-        "canonical_name": canonical_name
-    }
-```
-
-### 6.7 Category Versioning + Recurrence Detection
-
-Before creating a new memory category, check for an existing one:
+### 7.7 Category Versioning + Recurrence Detection
 
 ```python
-def find_matching_category(new_extraction: dict, user_id: str) -> str | None:
-    # embed the new summary
-    # search memory_{user_id}
-    hits = search_qdrant(
-        f"memory_{user_id}",
-        query_vector=embed(new_extraction["summary"]),
-        limit=5, score_threshold=settings.recurrence_similarity_threshold
-    )
+def find_matching_category(new_extraction, user_id) -> str | None:
+    hits = search_qdrant(f"memory_{user_id}",
+                         embed(new_extraction["summary"]),
+                         score_threshold=settings.recurrence_similarity_threshold)
     for hit in hits:
-        # check entity overlap
-        existing_entities = {e["canonical_name"] for e in hit.payload["named_entities"]}
-        new_entities = {e["name"] for e in new_extraction["named_entities"]}
-        overlap = len(existing_entities & new_entities) / max(len(existing_entities | new_entities), 1)
+        existing = {e["canonical_name"] for e in hit.payload["named_entities"]}
+        new      = {e["name"]           for e in new_extraction["named_entities"]}
+        overlap  = len(existing & new) / max(len(existing | new), 1)
         if overlap >= settings.recurrence_entity_overlap_threshold:
-            return hit.id  # recurrence of this category
-    return None  # new category
-```
+            return hit.id
+    return None
 
-**If recurrence detected:** add new version to existing category. Update `recurrence_count`, `cycles`, `avg_cycle_duration_days`, `avg_gap_between_cycles_days`. Recompute `predicted_resolution`.
-
-**If new category:** create with version 1.
-
-**Hash computation:**
-```python
-import hashlib, json
-
-def compute_category_hash(member_point_ids: list, embed_model: str) -> str:
-    content = json.dumps({
-        "ids": sorted(member_point_ids),
-        "embed_model": embed_model,
-    }, sort_keys=True)
-    return hashlib.sha256(content.encode()).hexdigest()[:16]
-```
-
-Only re-embed and re-upsert a category if the hash changed. Pass existing summary + new points for incremental updates, not full re-extraction.
-
-### 6.8 Prediction Lifecycle
-
-```python
-# predictor.py — runs every 6 hours via Celery beat
-
-def validate_predictions(user_id: str):
-    # get all PENDING predictions across all memory categories
-    pending = get_pending_predictions(user_id)
-
-    for pred in pending:
-        # check expiry
-        if days_since(pred.predicted_at) > settings.prediction_pending_expiry_days:
-            update_prediction_status(pred.id, "expired")
-            continue
-
-        # search recent raw_ingest for evidence
-        # embed prediction text, search raw_ingest_{uid} with recency filter
-        evidence = search_qdrant(
-            f"raw_ingest_{user_id}",
-            query_vector=embed(pred.text),
-            limit=5,
-            score_threshold=0.75,
-            filter={"timestamp": {"gte": pred.predicted_at}}
-        )
-
-        if evidence:
-            update_prediction_status(pred.id, "confirmed",
-                resolution_evidence=[e.id for e in evidence])
-            # confirmed predictions increase parent category confidence
-            increment_category_confidence(pred.category_id, delta=0.05)
-        # else: leave as PENDING until expiry
+# hash = sha256(sorted(member_point_ids) + embed_model)[:16]
+# only re-embed + re-upsert if hash changed
+# incremental update: pass existing summary + new points only, not full re-extraction
 ```
 
 ---
 
-## 7. Phase 6 — Retrieval Engine
+## 8. Phase 6 — Trends and Predictions (Mechanically Distinct)
 
-### 7.1 Query Classifier
+This is a critical architectural requirement. Trends and predictions are **not the same thing** and must never be computed or stored together.
 
-Before executing any retrieval, classify the query type. This determines the execution path.
+### 8.1 Trend Calculator (`trend_calculator.py`)
+
+Trends are **objective mathematical measurements**. No LLM involvement. No confidence score. No probabilistic language.
+
+```python
+# Runs every 6 hours via Celery beat for each user.
+# For each entity in entity_registry_{uid}:
+
+def calculate_trend(entity_id: str, user_id: str) -> dict:
+    # pull occurrence_timestamps from entity payload
+    timestamps = get_occurrence_timestamps(entity_id, user_id)
+
+    if len(timestamps) < settings.trend_min_observations:
+        return {"direction": "insufficient_data", "slope": None, "cv": None}
+
+    # convert timestamps to (day_number, count_per_week) series
+    series = aggregate_to_weekly_counts(timestamps)
+
+    # linear regression slope
+    slope = linregress(range(len(series)), series).slope
+
+    # coefficient of variation for volatility
+    cv = np.std(series) / np.mean(series) if np.mean(series) > 0 else 0.0
+
+    if cv >= settings.trend_volatility_cv_threshold:
+        direction = "volatile"
+    elif abs(slope) < 0.05:
+        direction = "stable"
+    elif slope > 0:
+        direction = "increasing"
+    else:
+        direction = "decreasing"
+
+    return {
+        "direction": direction,
+        "slope": round(slope, 4),
+        "coefficient_of_variation": round(cv, 4),
+        "observation_count": len(timestamps),
+        "last_calculated": datetime.utcnow().isoformat(),
+        "provenance": "calculated"
+    }
+
+# Write result to entity_registry_{uid} point payload.
+# Never infer, never guess, never use LLM for this step.
+```
+
+### 8.2 Prediction Scorer (`predictor.py`)
+
+Predictions are **probabilistic hypotheses** derived from trends. They have confidence scores. They decay. They resolve.
+
+**Prediction creation** — triggered when trend calculator detects a directional trend with sufficient observations:
+
+```python
+def maybe_create_prediction(entity_id: str, trend: dict, user_id: str):
+    # only create if direction is increasing or decreasing (not stable/volatile/insufficient)
+    if trend["direction"] not in ("increasing", "decreasing"):
+        return
+
+    # check if prediction already exists for this entity+direction
+    existing = get_active_prediction(entity_id, user_id)
+    if existing:
+        return  # scorer will update it; don't create duplicate
+
+    initial_confidence = min(0.5 + abs(trend["slope"]) * 2, 0.85)
+    # cap initial confidence at 0.85; must be earned through evidence
+
+    create_prediction(
+        entity_id=entity_id,
+        user_id=user_id,
+        text=generate_prediction_text(entity_id, trend),  # template, not LLM
+        initial_confidence=initial_confidence,
+        current_weight=initial_confidence,
+        source_trend_direction=trend["direction"],
+        provenance="predicted",
+        provenance_chain=[entity_id]
+    )
+```
+
+**Prediction text generation** — template-based, never LLM:
+
+```python
+PREDICTION_TEMPLATES = {
+    "increasing": "{entity} has been occurring more frequently and is likely to continue increasing.",
+    "decreasing": "{entity} has been occurring less frequently and is likely to continue decreasing.",
+}
+# keep it simple and factual; calling AI agent can elaborate
+```
+
+**Prediction scoring** — Bayesian-like evidence accumulation, runs every 6 hours:
+
+```python
+def score_predictions(user_id: str):
+    pending = get_pending_predictions(user_id)
+
+    for pred in pending:
+        # check expiry first
+        age_days = days_since(pred.predicted_at)
+        if age_days > settings.prediction_pending_expiry_days:
+            update_status(pred.id, "expired")
+            continue
+
+        # search recent raw_ingest for confirming evidence
+        confirming = search_qdrant(
+            f"raw_ingest_{user_id}",
+            embed(pred.text),
+            score_threshold=0.75,
+            filter={"timestamp": {"gte": pred.last_scored_at}}
+        )
+
+        # search for refuting evidence (opposite direction)
+        refuting_query = generate_refuting_query(pred)
+        refuting = search_qdrant(
+            f"raw_ingest_{user_id}",
+            embed(refuting_query),
+            score_threshold=0.75,
+            filter={"timestamp": {"gte": pred.last_scored_at}}
+        )
+
+        # Bayesian-like update
+        new_weight = pred.current_weight
+
+        for _ in confirming:
+            new_weight = new_weight + (1 - new_weight) * 0.1   # confirming nudge up
+        for _ in refuting:
+            new_weight = new_weight * 0.7                       # refuting pushes down
+
+        # temporal decay: weight halves every decay_halflife_days without evidence
+        if not confirming and not refuting:
+            decay = 0.5 ** (1 / settings.prediction_decay_halflife_days)
+            new_weight *= decay
+
+        new_weight = max(0.0, min(1.0, new_weight))
+
+        # resolution check
+        if new_weight >= settings.prediction_confirmation_threshold:
+            update_status(pred.id, "confirmed",
+                          evidence_ids=[e.id for e in confirming])
+        elif new_weight < 0.1:
+            update_status(pred.id, "refuted")
+        else:
+            update_weight(pred.id, new_weight,
+                          confirming_count=len(confirming),
+                          refuting_count=len(refuting))
+
+        # prediction resolution feeds back to parent memory category confidence
+        if pred.status in ("confirmed", "refuted"):
+            adjust_category_confidence(
+                pred.source_category_id,
+                delta=+0.03 if pred.status == "confirmed" else -0.02
+            )
+```
+
+---
+
+## 9. Phase 7 — Horizon Scout System
+
+The horizon scout is the **exclusive interface with the external world**. It operates in a sandboxed layer. It can never write directly to `raw_ingest_{uid}` or `memory_{uid}`. If it could, external news would contaminate autobiographical memory — a fatal trust failure called **context collapse**.
+
+The only path for external intelligence to become personal memory is **explicit human action**.
+
+### 9.1 Scout Cycle (`scout.py`)
+
+Runs weekly. Acquires lock before executing.
+
+```python
+def run_scout_cycle(user_id: str):
+    # Step 1: identify highest-trending entities
+    entities = get_top_trending_entities(
+        user_id,
+        limit=settings.scout_top_entities,
+        sort_by="mention_count_recency_combined"
+    )
+
+    # Step 2: generate targeted search queries from entities
+    queries = []
+    for entity in entities:
+        queries.append(f"{entity.canonical_name} {settings.operator_geography}")
+        queries.append(f"{entity.canonical_name} news last week")
+        if entity.type == "Infrastructure":
+            queries.append(f"{entity.canonical_name} vulnerability exploit CVE")
+        if entity.type in ("Condition", "Symptom", "Medication"):
+            queries.append(f"{entity.canonical_name} research update")
+
+    # Step 3: retrieve external results, restricted to last N days
+    raw_results = []
+    for query in queries:
+        results = web_search(
+            query=query,
+            date_restrict=f"d{settings.scout_lookback_days}",
+            max_results=settings.scout_max_results_per_query
+        )
+        raw_results.extend(results)
+
+    # Step 4: deduplicate by URL
+    raw_results = deduplicate_by_url(raw_results)
+
+    # Step 5: gatekeeper evaluation (two-tier)
+    for result in raw_results:
+        evaluate_and_route(result, user_id, entities)
+```
+
+### 9.2 Gatekeeper — Two-Tier Evaluation (`gatekeeper.py`)
+
+**Tier 1: Thematic Relevance**
+
+```python
+GATEKEEPER_SYSTEM_PROMPT = """
+You evaluate external news for relevance to a specific person's life context.
+Return ONLY valid JSON. No commentary.
+
+Schema:
+{
+  "relevance_score": 0.0-1.0,
+  "relevance_reasoning": "one sentence",
+  "matching_entities": ["entity names from the provided registry"],
+  "urgency_score": 0.0-1.0,
+  "requires_immediate_bypass": false,
+  "bypass_reason": null,
+  "alert_type": null
+}
+
+Relevance scoring rules:
+- Score 0.9-1.0: directly affects the person's named entities, health, finances, or infrastructure
+- Score 0.75-0.89: closely related to named entities or operational environment
+- Score 0.5-0.74: tangentially related
+- Score below 0.5: general news with no meaningful personal connection
+- General world events, overseas conflicts, macro trends: score < 0.3 unless entity match
+
+Urgency and bypass rules — requires_immediate_bypass = true ONLY if:
+  PHYSICAL_SAFETY: active emergency, wildfire, extreme weather, evacuation order,
+                   or localized physical threat in the operator's geography
+  INFRASTRUCTURE_DEATH: actively exploited zero-day or critical vulnerability
+                        directly affecting the operator's named infrastructure stack
+
+requires_immediate_bypass = false for:
+  - political news
+  - overseas events
+  - industry trends
+  - research updates
+  - financial market movements
+  - anything not in the strict criteria above
+
+Be ruthlessly pragmatic. The operator's attention is finite and valuable.
+"""
+
+def evaluate_result(result: dict, entity_registry: list, blast_radius: dict) -> dict:
+    prompt = f"""
+Operator blast radius:
+  Geography: {blast_radius['geography']}
+  Infrastructure: {blast_radius['infrastructure']}
+  Family dependencies: {blast_radius['family_dependencies']}
+
+Personal entity registry (top trending):
+{json.dumps([e['canonical_name'] for e in entity_registry], indent=2)}
+
+External item to evaluate:
+  Title: {result['title']}
+  Summary: {result['snippet']}
+  Source: {result['url']}
+  Date: {result['date']}
+"""
+    response = litellm_call(settings.gatekeeper_model, GATEKEEPER_SYSTEM_PROMPT, prompt)
+    return validate_gatekeeper_response(response)  # Pydantic validation required
+```
+
+**Tier 2: Routing Decision**
+
+```python
+def route_result(evaluation: dict, result: dict, user_id: str):
+
+    if evaluation["requires_immediate_bypass"]:
+        # create alert, skip discovery queue
+        create_alert(
+            user_id=user_id,
+            scan_id=result["id"],
+            alert_type=evaluation["alert_type"],
+            severity="critical",
+            title=result["title"],
+            summary=result["snippet"],
+            source_url=result["url"],
+            affected_geography=settings.operator_geography,
+            affected_infrastructure=evaluation["matching_entities"]
+        )
+        deliver_alert_immediately(user_id)
+        return
+
+    if evaluation["relevance_score"] >= settings.scout_relevance_threshold:
+        # write to sandboxed horizon_scan collection
+        upsert_horizon_scan(
+            user_id=user_id,
+            result=result,
+            evaluation=evaluation,
+            status="new"
+        )
+        # add to discovery queue for daily digest
+        enqueue_discovery(user_id, result["id"])
+        return
+
+    # below threshold: discard silently (log to debug only)
+    log_debug(f"scout: discarded [{evaluation['relevance_score']:.2f}] {result['title']}")
+```
+
+### 9.3 Blast Radius Configuration (`blast_radius.py`)
+
+The blast radius is the hardcoded operational context injected into every gatekeeper evaluation. It never changes automatically. Only the operator updates it manually.
+
+```python
+def get_blast_radius(user_id: str) -> dict:
+    # loaded from .env and config; not from database
+    # this is intentional — blast radius is a deliberate operator configuration,
+    # not an inferred property
+    return {
+        "geography": settings.operator_geography,
+        "infrastructure": settings.operator_infrastructure,
+        "family_dependencies": settings.operator_family_dependencies,
+    }
+```
+
+### 9.4 Internalization Gate
+
+External intelligence in `horizon_scan_{uid}` may ONLY transition to `raw_ingest_{uid}` through one of these explicit human actions:
+
+1. User calls `POST /horizon/{user_id}/{scan_id}/internalize` — API endpoint
+2. User discusses the item in conversation and the calling AI agent explicitly calls the internalize endpoint
+3. User uses a `!save` or equivalent slash command in the delivery channel (Discord etc.)
+
+```python
+def internalize_scan(scan_id: str, user_id: str, action_source: str):
+    scan = get_scan(scan_id, user_id)
+
+    # write to raw_ingest as a new observed point
+    # provenance = "observed" (human chose to internalize it)
+    # provenance_chain = [scan_id]
+    # source_type = "external_internalized"
+    # raw_text = scan.summary + " [Source: " + scan.source_url + "]"
+
+    ingest_point = create_raw_point(
+        user_id=user_id,
+        raw_text=f"{scan.title}. {scan.summary}. Source: {scan.source_url}",
+        source_type="external_internalized",
+        provenance="observed",
+        provenance_chain=[scan_id],
+        timestamp=datetime.utcnow()
+    )
+    write_to_raw_ingest(user_id, ingest_point)
+
+    # update scan status
+    update_scan_status(scan_id, user_id, "internalized",
+                       internalized_at=datetime.utcnow(),
+                       internalized_by=action_source)
+```
+
+---
+
+## 10. Phase 8 — Retrieval Engine
+
+### 10.1 Query Classifier
 
 ```python
 QUERY_TYPES = {
     "current":       ["right now", "currently", "today", "am i", "what's happening"],
-    "retrospective": ["ago", "last week", "last month", "in january", "when did", "used to"],
-    "predictive":    ["will", "going to", "likely", "predict", "expect", "pattern suggests"],
+    "retrospective": ["ago", "last week", "last month", "when did", "used to", "in january"],
+    "predictive":    ["will", "going to", "likely", "predict", "expect", "trending"],
     "causal":        ["why", "what causes", "what triggers", "because of", "led to"],
     "longitudinal":  ["over time", "trend", "changing", "getting better", "getting worse"],
+    "horizon":       ["news", "external", "what's happening out there", "any alerts"],
     "drill":         ["show me", "give me details", "more about", "what exactly"],
 }
-
-def classify_query(question: str) -> str:
-    question_lower = question.lower()
-    for qtype, signals in QUERY_TYPES.items():
-        if any(s in question_lower for s in signals):
-            return qtype
-    return "semantic"  # default: vector similarity
 ```
 
-### 7.2 Retrieval Paths
+### 10.2 Retrieval Paths
 
 ```python
 async def query(
@@ -932,157 +1275,145 @@ async def query(
     domain_filter: str = None,
     time_range: dict = None,
     include_raw: bool = False,
-    drill_entity: str = None
+    drill_entity: str = None,
+    include_predictions: bool = True,
+    include_horizon: bool = False,   # horizon never included by default
 ) -> RetrievalResult:
 
     q_type = classify_query(question)
     q_vector = embed(question)
 
-    if q_type == "current":
-        memory_hits = search_qdrant(
-            f"memory_{user_id}", q_vector, limit=top_k,
-            filter={"current_status": "active"}
+    # Layer 0: memory categories
+    memory_hits = route_memory_query(q_type, q_vector, user_id, top_k, time_range)
+
+    # Layer 1: trends (from entity registry, not LLM)
+    trend_hits = []
+    if q_type in ("longitudinal", "predictive", "current"):
+        trend_hits = get_entity_trends(user_id, entities_from_hits(memory_hits))
+
+    # Layer 2: predictions (separate collection)
+    prediction_hits = []
+    if include_predictions and q_type in ("predictive", "current"):
+        prediction_hits = search_qdrant(
+            f"predictions_{user_id}", q_vector, limit=top_k,
+            filter={"status": "pending"}
         )
 
-    elif q_type == "retrospective":
-        # extract time reference from question (regex or small LLM call)
-        time_window = extract_time_reference(question)
-        memory_hits = search_qdrant(
-            f"memory_{user_id}", q_vector, limit=top_k,
-            filter={"temporal.time_range.earliest": {"lte": time_window["end"]},
-                    "temporal.time_range.latest":   {"gte": time_window["start"]}}
+    # Layer 3: horizon scan (explicit opt-in only)
+    horizon_hits = []
+    if include_horizon and q_type == "horizon":
+        horizon_hits = search_qdrant(
+            f"horizon_scan_{user_id}", q_vector, limit=top_k,
+            filter={"status": "new"}
         )
 
-    elif q_type == "predictive":
-        memory_hits = search_qdrant(
-            f"memory_{user_id}", q_vector, limit=top_k,
-            filter={"predictions": {"status": "pending", "confidence": {"gte": 0.65}}}
-        )
-
-    elif q_type == "longitudinal":
-        # get all versions of matching categories
-        memory_hits = search_qdrant(f"memory_{user_id}", q_vector, limit=top_k)
-        # sort versions by timestamp within each hit
-
-    elif q_type == "causal":
-        # focus on named_relationships with causal types
-        memory_hits = search_qdrant(
-            f"memory_{user_id}", q_vector, limit=top_k * 2
-        )
-        memory_hits = filter_by_relationship_types(
-            memory_hits, ["TRIGGERS", "CAUSES", "WORSENS", "PRECEDES"]
-        )[:top_k]
-
-    else:  # semantic default
-        memory_hits = search_qdrant(f"memory_{user_id}", q_vector, limit=top_k)
-
-    # apply domain filter if provided
-    if domain_filter:
-        memory_hits = [h for h in memory_hits
-                       if h.payload["domain_distribution"].get(domain_filter, 0) >= 0.3]
-
-    # optional: drill into raw_ingest for source material
-    raw_hits = []
-    if include_raw:
-        raw_hits = search_qdrant(
-            f"raw_ingest_{user_id}", q_vector, limit=3,
-            filter={"memory_agent_seen": True}
-        )
-
-    # optional: multi-hop entity traversal
+    # optional drill
     connected_categories = []
     if drill_entity:
         connected_categories = traverse_entity(drill_entity, user_id, hops=2)
 
+    raw_snippets = []
+    if include_raw:
+        raw_snippets = search_qdrant(
+            f"raw_ingest_{user_id}", q_vector, limit=3,
+            filter={"memory_agent_seen": True}
+        )
+
     return RetrievalResult(
         query_type=q_type,
+        user_id=user_id,
         memory_categories=[format_memory_hit(h) for h in memory_hits],
+        trend_summaries=[format_trend(t) for t in trend_hits],
+        active_predictions=[format_prediction(p) for p in prediction_hits],
+        horizon_items=[format_horizon(h) for h in horizon_hits],
         connected_categories=connected_categories,
-        raw_snippets=[r.payload["raw_text"] for r in raw_hits],
+        raw_snippets=[r.payload["raw_text"] for r in raw_snippets],
         drill_available=True,
-        user_id=user_id
+        retrieved_at=datetime.utcnow().isoformat()
     )
 ```
 
-### 7.3 Multi-hop Traversal (application-level, no graph DB)
+### 10.3 Multi-hop Traversal (application code)
 
 ```python
 def traverse_entity(entity_name: str, user_id: str, hops: int = 2) -> list:
-    visited_categories = set()
-    frontier_entities = {entity_name}
+    visited = set()
+    frontier = {entity_name}
     results = []
 
-    for hop in range(hops):
-        # find categories containing any entity in frontier
+    for _ in range(hops):
         new_categories = []
-        for entity in frontier_entities:
-            hits = search_qdrant(
-                f"memory_{user_id}",
-                query_vector=embed(entity),
-                limit=5
-            )
-            # filter to categories that actually name this entity
+        for entity in frontier:
+            hits = search_qdrant(f"memory_{user_id}", embed(entity), limit=5)
             hits = [h for h in hits
                     if any(e["canonical_name"] == entity
                            for e in h.payload["named_entities"])]
             new_categories.extend(hits)
 
-        # deduplicate
-        new_categories = [c for c in new_categories
-                          if c.id not in visited_categories]
-        visited_categories.update(c.id for c in new_categories)
+        new_categories = [c for c in new_categories if c.id not in visited]
+        visited.update(c.id for c in new_categories)
         results.extend(new_categories)
 
-        # expand frontier: collect all entities from new categories
-        frontier_entities = set()
-        for cat in new_categories:
-            for e in cat.payload["named_entities"]:
-                frontier_entities.add(e["canonical_name"])
+        frontier = {e["canonical_name"]
+                    for c in new_categories
+                    for e in c.payload["named_entities"]}
 
     return results
 ```
 
-### 7.4 RetrievalResult Schema
+### 10.4 RetrievalResult Schema
 
 ```python
 class RetrievalResult(BaseModel):
     query_type: str
     user_id: str
     memory_categories: list[MemoryCategoryResult]
+    trend_summaries: list[TrendSummary]
+    active_predictions: list[PredictionResult]
+    horizon_items: list[HorizonItem]        # empty unless explicitly requested
     connected_categories: list[MemoryCategoryResult]
     raw_snippets: list[str]
     drill_available: bool
-    retrieved_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    retrieved_at: str
 
-class MemoryCategoryResult(BaseModel):
-    category_id: str
-    category_label: str
-    current_status: str
-    summary: str               # current version summary
-    confidence: float
-    named_entities: list       # with canonical names + roles
-    named_relationships: list  # with evidence counts
-    active_predictions: list   # status=pending only
-    temporal: dict             # full temporal block
-    domain_distribution: dict
-    recurrence_count: int
-    drill_entity_ids: list     # shared_entity_ids for drill-down
+class TrendSummary(BaseModel):
+    entity_name: str
+    canonical_name: str
+    direction: str
+    slope: float
+    observation_count: int
+    provenance: str = "calculated"    # always calculated, never inferred
+
+class PredictionResult(BaseModel):
+    prediction_id: str
+    text: str
+    current_weight: float
+    status: str
+    source_entity: str
+    source_trend_direction: str
+    confirming_evidence_count: int
+    refuting_evidence_count: int
+    predicted_at: str
+    provenance: str = "predicted"
 ```
 
 ---
 
-## 8. Phase 7 — API
+## 11. Phase 9 — API
 
 ```python
 # api/main.py — FastAPI
 
-POST /users/{user_id}                    # register new user, create collections
-DELETE /users/{user_id}                  # delete all user collections (with confirmation param)
+# User management
+POST   /users/{user_id}
+DELETE /users/{user_id}?confirm=true
 
-POST /ingest/{user_id}                   # upload file(s), returns job_id
-GET  /ingest/{user_id}/status            # queue depth, unprocessed count
+# Ingest
+POST   /ingest/{user_id}                # file upload
+GET    /ingest/{user_id}/status
 
-POST /query                              # main retrieval
+# Query (primary endpoint for calling AI agent)
+POST   /query
   body: {
     question: str,
     user_id: str,
@@ -1090,108 +1421,96 @@ POST /query                              # main retrieval
     domain_filter: str = null,
     time_range: {start: ISO, end: ISO} = null,
     include_raw: bool = false,
+    include_predictions: bool = true,
+    include_horizon: bool = false,      # must be explicit; never default true
     drill_entity: str = null
   }
 
-GET  /memory/{user_id}                   # list all memory categories
-GET  /memory/{user_id}/{category_id}     # full category detail with all versions
-GET  /memory/{user_id}/active            # current_status=active only
-GET  /memory/{user_id}/predictions       # all pending predictions
+# Memory
+GET    /memory/{user_id}
+GET    /memory/{user_id}/active
+GET    /memory/{user_id}/{category_id}
 
-GET  /entities/{user_id}                 # list personal entity registry
-GET  /entities/shared                    # list shared entity registry
+# Trends (read-only; calculated, not LLM)
+GET    /trends/{user_id}
+GET    /trends/{user_id}/{entity_id}
 
-GET  /status                             # system health
-  returns: {
-    services: {qdrant, redis, litellm},
-    users: [{user_id, raw_count, memory_count, entity_count}],
-    shared_entity_count: int,
-    agent_locks: {user_id: locked/free},
-    failed_ingest_count: int
-  }
+# Predictions
+GET    /predictions/{user_id}
+GET    /predictions/{user_id}/pending
+GET    /predictions/{user_id}/{prediction_id}
 
-GET  /audit/taxonomy                     # relationship types not in taxonomy
-GET  /audit/coherence/{user_id}          # categories flagged for split/merge
+# Horizon scout
+GET    /horizon/{user_id}               # list new scan items
+GET    /horizon/{user_id}/alerts        # unacknowledged alerts
+POST   /horizon/{user_id}/{scan_id}/internalize    # explicit human gate
+POST   /horizon/{user_id}/{scan_id}/dismiss
+POST   /alerts/{user_id}/{alert_id}/acknowledge
+
+# Entities
+GET    /entities/{user_id}
+GET    /entities/shared
+
+# System
+GET    /status
+GET    /audit/taxonomy
+GET    /audit/coherence/{user_id}
+GET    /audit/schema-drift
 ```
 
 ---
 
-## 9. Hardening Requirements
+## 12. Hardening Requirements
 
-### 9.1 Embed Model Consistency
+### 12.1 Embed Model Consistency
 
-On every collection write, verify embed model matches collection sentinel. If mismatch detected, STOP and report. Never write mismatched vectors.
+Sentinel check on every collection write. HARD STOP on dimension mismatch.
 
-If embed model must be upgraded:
-1. Create new collections with `_v2` suffix
-2. Re-embed all points from old collection into new
-3. Verify point counts match
-4. Rename (or update config to point to new collections)
-5. Archive old collections, do not delete for 30 days
+Upgrade path:
+1. Create `{collection}_v2` with new model
+2. Re-embed all points
+3. Verify point count match
+4. Swap config pointer
+5. Archive old collection for 30 days, then delete
 
-### 9.2 Schema Drift Monitoring
+### 12.2 Schema Drift Monitoring
 
-Weekly Celery task. Query Qdrant for relationship type values in memory collection payload. Compare against `FLAT_TAXONOMY`. Output to `./logs/schema_drift.log`:
+Weekly Celery task. Output to `./logs/schema_drift.log`. Backfill migrations for unknown types with n > 10.
 
-```
-SCHEMA DRIFT REPORT — 2025-01-15
-==================================
-unknown_relationship_types:
-  BOUGHT (n=14)          → suggest: PURCHASED
-  MADE_WORSE (n=7)       → suggest: WORSENS
-  HAD (n=31)             → suggest: EXPERIENCED
-
-unknown_entity_types:
-  Health_Issue (n=8)     → suggest: Condition
-  Trigger (n=4)          → suggest: Condition + role=trigger
-
-action_required: run backfill migration for types with n > 10
-```
-
-### 9.3 Backup
+### 12.3 Backup
 
 Daily Celery task:
-
 ```bash
-# Qdrant snapshot
-curl -X POST http://localhost:6333/collections/{name}/snapshots
-# copy snapshot files to ./backups/qdrant/YYYY-MM-DD/
-
-# Redis
-redis-cli BGSAVE
-cp /var/lib/redis/dump.rdb ./backups/redis/YYYY-MM-DD/
-
-# retain 30 days of backups, delete older
+# Qdrant snapshots → ./backups/qdrant/YYYY-MM-DD/
+# Redis BGSAVE → ./backups/redis/YYYY-MM-DD/
+# Retain 30 days. Delete older.
 ```
 
-### 9.4 Migration System
+### 12.4 Migration System
 
-```python
-# migrations/runner.py
-# tracks executed migrations in a reserved Qdrant point
-# (id=0, collection=shared_entity_registry, payload.migrations=[...])
-# each migration file: numbered, has up() and is_applied() methods
-# runner checks is_applied() before executing
-# never re-runs applied migrations
-```
+Tracked via sentinel point in `shared_entity_registry` (id=0, payload.migrations=[...]). Numbered files. Idempotent. Never re-runs applied migrations.
 
-### 9.5 LiteLLM Model Logging
+### 12.5 LiteLLM Model Logging
 
-Log `model_used` on every LLM call result. Store in memory category payload:
+Every LLM call records `model_used`, `prompt_tokens`, `completion_tokens`, `extraction_timestamp` in the resulting payload. Enables auditing if model quality variance emerges across load-balanced backends.
+
+### 12.6 Dead Letter
+
+All failures append to `./logs/failed_ingest.jsonl`:
 ```json
-"extraction_meta": {
-  "model_used": "string",
-  "extraction_timestamp": "ISO-8601",
-  "prompt_tokens": 0,
-  "completion_tokens": 0
+{
+  "timestamp": "ISO-8601",
+  "user_id": "string",
+  "task": "ingest|memory_agent|scout|gatekeeper|predictor",
+  "error": "string",
+  "traceback": "string",
+  "payload_preview": "first 200 chars"
 }
 ```
 
-Enables auditing which model produced which extractions if quality variance emerges across load-balanced models.
-
 ---
 
-## 10. docker-compose.yml
+## 13. docker-compose.yml
 
 ```yaml
 version: "3.9"
@@ -1207,8 +1526,7 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
-    volumes:
-      - ./data/redis:/data
+    volumes: ["./data/redis:/data"]
     command: redis-server --save 60 1 --loglevel warning
     restart: unless-stopped
 
@@ -1234,51 +1552,51 @@ services:
       - ./logs:/app/logs
     restart: unless-stopped
 
-# LiteLLM and llama.cpp are NOT in this compose file
-# They are assumed already running on the host
-# Configure LITELLM_BASE_URL in .env to point to them
+# LiteLLM and llama.cpp run on host, not in this compose file.
+# Configure LITELLM_BASE_URL in .env.
 ```
 
 ---
 
-## 11. Adding a New User
+## 14. Adding a New User
 
 ```python
 def register_user(user_id: str):
-    # validate user_id: alphanumeric + underscore only, max 32 chars
     assert re.match(r'^[a-z0-9_]{1,32}$', user_id), "invalid user_id"
 
-    collections_to_create = [
+    for name in [
         f"raw_ingest_{user_id}",
         f"memory_{user_id}",
         f"entity_registry_{user_id}",
-    ]
-
-    for name in collections_to_create:
+        f"predictions_{user_id}",
+        f"horizon_scan_{user_id}",
+        f"alerts_{user_id}",
+    ]:
         if not collection_exists(name):
             create_collection(name, settings.embed_dim)
             write_sentinel(name, settings.embed_model, settings.embed_dim)
         else:
             verify_sentinel(name, settings.embed_model, settings.embed_dim)
 
-    # create drop zone directory
     os.makedirs(f"./drop/{user_id}/processed", exist_ok=True)
-    os.makedirs(f"./drop/{user_id}/failed", exist_ok=True)
-
-    # register memory agent for this user in Celery
+    os.makedirs(f"./drop/{user_id}/failed",    exist_ok=True)
     register_agent_schedule(user_id)
-    
-    log(f"user {user_id} registered successfully")
+    log(f"user {user_id} registered")
 ```
 
 ---
 
-## 12. What This System Does NOT Do
+## 15. What This System Does NOT Do
 
-Be explicit with the agent about intentional non-goals:
+Explicit non-goals. Do not implement these.
 
-- **No generative responses.** The API returns structured data. The calling AI agent generates any natural language responses. This system retrieves; it does not narrate.
-- **No real-time streaming.** Ingest and memory agent are async background processes. Query is synchronous but returns cached/pre-computed memory, not live computation.
-- **No cross-user data access.** A query for `user_id=alice` never touches `user_id=bob` collections under any circumstances. No shared behavioral data. No aggregate analytics across users.
-- **No automatic deletion.** Raw ingest points are never deleted. Memory categories are versioned, not replaced. The system is append-only by design. Manual deletion only via explicit admin API call.
-- **No Neo4j.** Multi-hop traversal is handled in application code. If traversal requirements grow beyond 4 hops or performance degrades on large datasets, revisit this decision explicitly rather than adding Neo4j mid-build.
+- **No generative responses.** Returns structured data. Calling AI agent narrates.
+- **No real-time streaming.** Background async processes. Query returns pre-computed memory.
+- **No cross-user behavioral data.** Query for alice never touches bob. Ever.
+- **No automatic deletion.** Append-only. Manual deletion via explicit admin API only.
+- **No Neo4j.** Application-code traversal. Revisit only at > 4 hops or non-personal scale.
+- **No automatic external→memory promotion.** Horizon scan items require explicit human action to internalize. A language model acting autonomously cannot trigger internalization.
+- **No confidence scores on trends.** Trends are mathematical facts. Only predictions carry confidence scores.
+- **No LLM in the trend calculation path.** Trends are computed with `numpy`/`scipy`. The LLM never touches the trend calculator.
+- **No unbounded web crawling.** Scout only queries for entities already in the personal entity registry, restricted to the last N days. It is not a news aggregator.
+- **No interruptions for non-critical events.** Bypass escalation is reserved for physical safety and infrastructure death criteria only. Political news, market movements, and general industry trends are never alerts.
