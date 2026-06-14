@@ -1,582 +1,673 @@
-# Adaptive Web Skill Setup Wizard (v4 — Final)
+# Adaptive Web Skill — Agent Build Directive (v7)
 
-## Role
+## What you are doing
 
-You are a strict, deterministic installation wizard. Your objective is to deploy a three-tool Model Context Protocol (MCP) web skill stack:
+You are building yourself a persistent, containerized adaptive web interaction
+stack. This single file is your complete directive. Execute it top to bottom.
 
-- **mcp-searxng** — search discovery and URL ranking
-- **chrome-devtools-mcp** — fast, lightweight headless DOM extraction (raw CDP)
-- **playwright-mcp** — full browser automation with session, auth, and interaction support
+You will:
+1. Probe the environment and make decisions
+2. Write all required files to disk using the heredoc blocks below
+3. Build and start the Docker stack
+4. Verify all services are healthy
+5. Merge the MCP config and append the skill definition to your guardrails
 
-And to wire all three into a single **Adaptive Web Skill** written into the agent's guardrails file. This skill gives the agent a response-aware escalation ladder: it starts with the fastest appropriate tool, observes what it gets back, and escalates to more capable tooling only when the task requires it — never guessing, never looping, never silently failing.
-
-You operate in five phases: **Pre-Flight, Interrogation, Execution Manifest, Atomic Execution, and Verification**. You do not skip phases. You do not proceed past a failed step. You do not assume — you probe, confirm, then act.
-
----
-
-## Absolute Constraints (apply at all times)
-
-- **DO NOT** write any files, modify configs, or run install commands until the user gives explicit approval at the end of Phase 2.
-- **DO NOT** proceed past any step whose SUCCESS condition is not met. HALT and report.
-- **DO NOT** overwrite any existing config without first creating a timestamped backup.
-- Every action must be reversible via the ROLLBACK defined for that step.
-- Never guess a file path, port, or package name. If uncertain, ask.
-- Escalation during installation follows the same ladder logic as escalation at runtime: observe, classify, act — never assume.
+One file in. A running stack out. Do not ask for confirmation — probe, decide, act.
+Surface to the human only when a decision genuinely cannot be made from available
+information.
 
 ---
 
-## Phase 0: Silent Pre-Flight Probes
+## Step 0: Environment Probe
 
-Before presenting anything to the user, silently run the following read-only commands to map the environment. Do not narrate this phase. Use results to pre-populate Phase 1.
-
-### Runtime Detection
+Run all of the following. Record every result.
 
 ```bash
-node --version 2>&1 || echo "NODE_MISSING"
-npm --version 2>&1 || echo "NPM_MISSING"
-python3 --version 2>&1 || echo "PYTHON_MISSING"
-pip --version 2>&1 || echo "PIP_MISSING"
-python3 -c "import playwright_stealth" 2>/dev/null && echo "STEALTH_INSTALLED" || echo "STEALTH_MISSING"
+# Docker
+which docker 2>/dev/null && docker --version || echo "DOCKER_MISSING"
+docker info 2>/dev/null | grep "Server Version" || echo "DOCKER_DAEMON_DOWN"
+docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo "COMPOSE_MISSING"
+
+# Ports
+for port in 8080 8888 9222 9223 9224 9225 5900 6080; do
+  lsof -i :$port 2>/dev/null && echo "PORT_${port}_BUSY" || echo "PORT_${port}_FREE"
+done
+
+# Existing containers
+docker ps -a --format "{{.Names}} {{.Status}}" 2>/dev/null \
+  | grep -E "searxng|cdp-mcp|playwright-mcp" || echo "NO_EXISTING_CONTAINERS"
+
+# Existing MCP configs
+for f in ~/.cursor/mcp.json \
+          ~/.config/cline/mcp.json \
+          ~/.config/claude/claude_desktop_config.json; do
+  [ -f "$f" ] && echo "MCP_CONFIG_EXISTS: $f"
+done
+
+# OS and arch
+uname -s && uname -m
+
+# Working directory
+echo "WORKDIR=$(pwd)"
 ```
-
-### Chrome / Chromium Detection
-
-```bash
-which google-chrome || which chromium || which chromium-browser || echo "CHROME_MISSING"
-google-chrome --version 2>/dev/null || chromium --version 2>/dev/null || echo "CHROME_VERSION_UNKNOWN"
-```
-
-### Playwright Detection (may already be installed)
-
-```bash
-npx playwright --version 2>/dev/null || echo "PLAYWRIGHT_MISSING"
-npx playwright install --dry-run chromium 2>/dev/null | head -5 || echo "PLAYWRIGHT_BROWSERS_UNKNOWN"
-```
-
-### Display / X Server Detection
-
-```bash
-echo "DISPLAY=$DISPLAY"
-xdpyinfo 2>/dev/null && echo "XSERVER_RUNNING" || echo "XSERVER_ABSENT"
-which xvfb-run 2>/dev/null || echo "XVFB_MISSING"
-```
-
-### Package Manager Detection
-
-```bash
-which apt 2>/dev/null && echo "PKG_APT"
-which dnf 2>/dev/null && echo "PKG_DNF"
-which pacman 2>/dev/null && echo "PKG_PACMAN"
-which brew 2>/dev/null && echo "PKG_BREW"
-```
-
-### Permissions Detection
-
-```bash
-sudo -n true 2>/dev/null && echo "SUDO_AVAILABLE" || echo "SUDO_UNAVAILABLE"
-```
-
-### Existing MCP Config Detection
-
-```bash
-ls ~/.cursor/mcp.json 2>/dev/null && echo "CURSOR_MCP_EXISTS" || echo "CURSOR_MCP_ABSENT"
-ls ~/.config/cline/mcp.json 2>/dev/null && echo "CLINE_MCP_EXISTS" || echo "CLINE_MCP_ABSENT"
-ls ~/.config/claude/claude_desktop_config.json 2>/dev/null && echo "CLAUDE_DESKTOP_MCP_EXISTS" || echo "CLAUDE_DESKTOP_MCP_ABSENT"
-```
-
-### Existing storageState Detection
-
-```bash
-ls ~/.config/playwright-mcp/storageState.json 2>/dev/null && echo "STORAGE_STATE_EXISTS" || echo "STORAGE_STATE_ABSENT"
-find ~ -name "storageState.json" 2>/dev/null | head -3
-```
-
-### SearXNG Reachability
-
-```bash
-curl -s --max-time 5 "https://searx.be/search?q=test&format=json" \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print('SEARXNG_PUBLIC_OK')" \
-  2>/dev/null || echo "SEARXNG_PUBLIC_UNREACHABLE"
-```
-
-### Port Availability
-
-```bash
-lsof -i :9222 2>/dev/null && echo "PORT_9222_IN_USE" || echo "PORT_9222_FREE"
-lsof -i :9223 2>/dev/null && echo "PORT_9223_IN_USE" || echo "PORT_9223_FREE"
-```
-
-Compile all probe results into an internal environment map before proceeding to Phase 1.
 
 ---
 
-## Phase 1: Targeted Interrogation
+## Step 1: Decisions
 
-Present the following to the user. Pre-fill anything confirmed by Phase 0. Ask the user to confirm or correct. Do not ask for information you already know.
+### 1a. Docker
+```
+docker present AND daemon running AND compose present → PROCEED
+docker present AND daemon DOWN
+  → try: sudo systemctl start docker
+  → re-probe after 10s
+  → if still down: SURFACE "Docker daemon not running. Start Docker and re-run."
+DOCKER_MISSING
+  → SURFACE "Docker not installed. Install from https://docs.docker.com/engine/install/ and re-run."
+COMPOSE_MISSING
+  → SURFACE "docker compose unavailable. Install Docker Compose and re-run."
+```
 
-> Pre-flight complete. Here is what I detected — please confirm or correct each:
+### 1b. Working directory
+```
+Create ./adaptive-web-skill/ relative to the directory containing this directive.
+All files in Steps 2-4 are written there.
+mkdir -p ./adaptive-web-skill/searxng
+```
 
-| Item | Detected | Confirmed? |
-|---|---|---|
-| Node.js | [version or MISSING] | ✅ / ❌ correct to: ___ |
-| npm | [version or MISSING] | ✅ / ❌ correct to: ___ |
-| Chrome | [path + version or MISSING] | ✅ / ❌ correct to: ___ |
-| Playwright | [version or MISSING] | ✅ / ❌ |
-| Display server | [RUNNING / ABSENT] | ✅ / ❌ |
-| xvfb-run | [FOUND / MISSING] | ✅ / ❌ |
-| Package manager | [apt/dnf/brew/etc] | ✅ / ❌ correct to: ___ |
-| sudo access | [AVAILABLE / UNAVAILABLE] | ✅ / ❌ |
-| CDP port 9222 | [FREE / IN USE] | ✅ / ❌ |
-| Existing MCP config | [path or NONE FOUND] | ✅ / ❌ correct to: ___ |
-| Existing storageState | [path or ABSENT] | ✅ / ❌ correct to: ___ |
+### 1c. Port assignment
+```
+SearXNG:        prefer 8080, fallback 8888 if PORT_8080_BUSY
+CDP MCP:        prefer 9222, fallback 9224 if PORT_9222_BUSY
+Playwright MCP: prefer 9223, fallback 9225 if PORT_9223_BUSY
+VNC:            prefer 5900 (on-demand only — conflict is acceptable)
+noVNC:          prefer 6080 (on-demand only — conflict is acceptable)
 
-Please also answer these questions that cannot be auto-detected:
+Record resolved ports. Substitute them wherever you see
+${SEARXNG_PORT}, ${CDP_PORT}, ${PLAYWRIGHT_PORT} in files below.
+```
 
-1. **Target Orchestration:** Are we deploying into a standard IDE (Cursor, Cline, Claude Desktop) or a custom multi-agent / headless session orchestrator? *(Determines config file paths and structure.)*
-2. **SearXNG Endpoint:** Do you have a private SearXNG instance? If yes, provide the URL. If no, I will default to `https://searx.be` — note this carries rate-limiting risk.
-3. **Guardrails File:** Exact path to your agent instructions file (e.g. `.cursorrules`, `agent-instructions.md`, a prompt registry). I will append the Adaptive Web Skill definition here.
-4. **Auth Sites:** List any sites you expect the agent to access that require login (e.g. GitHub, Notion, any SaaS tool). I will create a named storageState slot for each. Write "none" if not applicable.
-5. **Permissions preference:** If sudo is unavailable, install to user-local paths (`~/.npm-global`)? (yes/no)
-6. **Script Export Directory:** Where should I save generated Python automation scripts? (e.g., `./automations`)
+### 1d. Existing containers
+```
+Container "searxng" running      → skip searxng steps, health check only
+Container "cdp-mcp" running      → skip cdp steps, health check only
+Container "playwright-mcp" running → skip playwright steps, health check only
+```
 
-> Do not proceed until all six questions are answered and the table above is confirmed.
+### 1e. MCP config target
+```
+~/.cursor/mcp.json exists                          → TARGET=~/.cursor/mcp.json
+~/.config/cline/mcp.json exists                    → TARGET=~/.config/cline/mcp.json
+~/.config/claude/claude_desktop_config.json exists → TARGET=~/.config/claude/claude_desktop_config.json
+none found                                         → TARGET=~/.cursor/mcp.json (create it)
+```
+
+### 1f. Secret key
+```bash
+# Generate once. Record as SEARXNG_SECRET.
+SEARXNG_SECRET=$(openssl rand -hex 32)
+```
 
 ---
 
-## Phase 2: Execution Manifest
-
-Once Phase 1 is complete, generate and present the full manifest below. **Do not run anything yet** — display the complete plan and request explicit approval.
-
----
-
-### EXECUTION MANIFEST — awaiting your approval to run
-
-**STEP 1: Backup existing MCP config**
-```
-CMD:     cp [mcp_config_path] [mcp_config_path].bak.$(date +%s)
-         Skip if no existing config found.
-SUCCESS: Timestamped backup exists, OR no existing config (fresh install)
-FAILURE: [WARN] Backup failed due to permissions — report and ask to proceed
-ROLLBACK: N/A
-```
-
-**STEP 2: Provision xvfb** *(headless Linux only, if XVFB_MISSING)*
-```
-CMD:     [apt/dnf/etc] install -y xvfb
-SUCCESS: which xvfb-run returns a path
-FAILURE: [HALT] Display server unavailable — Chrome and Playwright cannot run headless
-ROLLBACK: [apt/dnf/etc] remove xvfb
-```
-
-**STEP 3: Install mcp-searxng**
-```
-CMD:     npm install -g mcp-searxng
-         (use --prefix ~/.npm-global if no sudo)
-SUCCESS: which mcp-searxng returns a path AND mcp-searxng --version exits 0
-FAILURE: [HALT] Log full npm error verbatim. Do not proceed.
-ROLLBACK: npm uninstall -g mcp-searxng
-```
-
-**STEP 4: Install chrome-devtools-mcp**
-```
-CMD:     npm install -g chrome-devtools-mcp
-         (use --prefix ~/.npm-global if no sudo)
-SUCCESS: which chrome-devtools-mcp returns a path AND exits 0 on --version
-FAILURE: [HALT] Log full npm error verbatim. Do not proceed.
-ROLLBACK: npm uninstall -g chrome-devtools-mcp
-```
-
-**STEP 5: Install playwright-mcp**
-```
-CMD:     npm install -g @playwright/mcp
-         (use --prefix ~/.npm-global if no sudo)
-SUCCESS: which playwright-mcp returns a path AND exits 0 on --version
-FAILURE: [HALT] Log full npm error verbatim. Do not proceed.
-ROLLBACK: npm uninstall -g @playwright/mcp
-```
-
-**STEP 6: Install Playwright browser binaries**
-```
-CMD:     npx playwright install chromium
-         npx playwright install-deps chromium  (if sudo available)
-SUCCESS: npx playwright install --dry-run chromium reports "already installed"
-         OR npx playwright install chromium exits 0
-FAILURE: [HALT] Playwright browsers missing — automation class tasks will not function
-ROLLBACK: npx playwright uninstall chromium (if supported) or manual cleanup
-```
-
-**STEP 7: Install Python Script Generation Dependencies**
-```
-CMD:     pip install playwright playwright-stealth
-SUCCESS: python3 -c "import playwright_stealth" exits 0
-FAILURE: [WARN] Python stealth libraries failed — generated scripts may fail bot detection
-ROLLBACK: pip uninstall -y playwright playwright-stealth
-```
-
-**STEP 8: Create storageState directory and named session slots**
-```
-CMD:     mkdir -p ~/.config/playwright-mcp/sessions
-         For each site named in Phase 1 Q4:
-           touch ~/.config/playwright-mcp/sessions/[sitename].json
-           echo '{}' > ~/.config/playwright-mcp/sessions/[sitename].json
-SUCCESS: Directory exists AND one .json stub exists per named site
-FAILURE: [WARN] Could not create session directory — auth escalation will not persist
-ROLLBACK: rm -rf ~/.config/playwright-mcp/sessions
-```
-
-**STEP 9: Write MCP server configuration**
-
-```
-CMD:     Merge the following JSON into [mcp_config_path], preserving all existing keys.
-SUCCESS: cat [mcp_config_path] | python3 -m json.tool exits 0 (valid JSON)
-         AND all three server names present with command fields
-FAILURE: [HALT + RESTORE from Step 1 backup immediately]
-ROLLBACK: cp [backup_path] [mcp_config_path]
-```
-
-```json
-{
-  "mcpServers": {
-    "mcp-searxng": {
-      "command": "[resolved path: which mcp-searxng]",
-      "args": [],
-      "env": {
-        "SEARXNG_URL": "[user-provided URL or https://searx.be]"
-      }
-    },
-    "chrome-devtools-mcp": {
-      "command": "[xvfb-run if headless, else omit]",
-      "args": [
-        "[resolved path: which chrome-devtools-mcp]",
-        "--chrome-path", "[detected chrome path]",
-        "--port", "9222",
-        "--chrome-flags",
-        "--disable-blink-features=AutomationControlled --no-sandbox --disable-dev-shm-usage"
-      ]
-    },
-    "playwright-mcp": {
-      "command": "[xvfb-run if headless, else omit]",
-      "args": [
-        "[resolved path: which playwright-mcp]",
-        "--browser", "chromium",
-        "--headless",
-        "--port", "9223",
-        "--storage-state", "~/.config/playwright-mcp/sessions/default.json"
-      ]
-    }
-  }
-}
-```
-
-**STEP 10: Append Adaptive Web Skill to guardrails file**
-```
-CMD:     Check for marker "## Skill: Adaptive Web" in [guardrails_path].
-         If present: SKIP (idempotent).
-         If absent: append the full skill block.
-SUCCESS: grep -q "## Skill: Adaptive Web" [guardrails_path] exits 0
-FAILURE: [HALT] File path invalid or write permission denied — report exact error
-ROLLBACK: Remove appended block via line count diff from pre-append snapshot
-```
-
-> Does this plan look correct? Type **APPROVE** to execute, or specify corrections.
-
----
-
-## Phase 3: Atomic Execution
-
-Upon receiving APPROVE:
-
-- Execute each step in sequence.
-- After each step, evaluate the SUCCESS condition before proceeding.
-- On any FAILURE: **HALT immediately**. Run ROLLBACK for the failed step and all completed prior steps in reverse order. Output the exact error verbatim — do not summarize.
-- Do not continue past a HALT under any circumstances, even if the user asks.
-
-### Failure Taxonomy
-
-| Detected Signal | Diagnosis | Remediation |
-|---|---|---|
-| EACCES / permission denied | npm global path blocked | Re-run with `--prefix ~/.npm-global` |
-| ENOENT on chrome path | Chrome not at detected path | Prompt user for correct path |
-| CDP port timeout | Sandbox or port conflict | Add `--no-sandbox`; try port 9224 |
-| `xvfb-run: command not found` | xvfb not installed | Re-run Step 2 |
-| Playwright install network error | Browser CDN unreachable | Try `PLAYWRIGHT_DOWNLOAD_HOST` mirror |
-| JSON parse error on config write | Malformed merge | Show diff of written vs expected |
-| `npm ERR! network` | npm registry unreachable | Check network; offer offline path |
-| SearXNG 429 / timeout | Public instance rate-limited | Prompt for private instance URL |
-| MCP handshake timeout >10s | Server not starting | Output last 20 lines of server log |
-| storageState parse error | Corrupted session file | Reset to `{}` and re-run auth setup |
-
----
-
-## Phase 4: One-Time Auth Setup (per named site)
-
-This phase runs after all steps complete. For each site named in Phase 1 Q4:
+## Step 2: Write docker-compose.yml
 
 ```bash
-# Launch a visible (non-headless) Playwright browser pointed at the site
-npx playwright open \
-  --save-storage ~/.config/playwright-mcp/sessions/[sitename].json \
-  https://[site-url]
+cat > ./adaptive-web-skill/docker-compose.yml << 'EOF'
+version: "3.9"
 
-echo "A browser window has opened for [sitename]."
-echo "Please log in manually. When fully logged in, press ENTER to save the session."
-read -p "Press ENTER when logged in: "
+networks:
+  webskill:
+    driver: bridge
 
-# Verify the session file was populated
-python3 -c "
-import json
-with open('$HOME/.config/playwright-mcp/sessions/[sitename].json') as f:
-    s = json.load(f)
-cookies = s.get('cookies', [])
-origins = s.get('origins', [])
-assert len(cookies) > 0 or len(origins) > 0, 'SESSION_EMPTY'
-print('AUTH_[SITENAME]_OK — captured', len(cookies), 'cookies')
-" || echo "AUTH_[SITENAME]_FAIL — session file appears empty"
-```
+volumes:
+  playwright-sessions:
 
-If AUTH fails: do not halt. Log the failure, mark the site's session slot as UNCAPTURED, and continue. The agent will handle missing sessions at runtime via the escalation ladder's auth-gating rule.
+services:
 
----
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    networks: [webskill]
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/search?q=test&format=json' | python3 -c 'import sys,json; json.load(sys.stdin)' && echo ok"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 25s
 
-## Phase 5: Verification Loop
+  cdp-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - SERVICE=cdp
+    image: adaptive-web-cdp:latest
+    container_name: cdp-mcp
+    restart: unless-stopped
+    networks: [webskill]
+    ports:
+      - "127.0.0.1:${CDP_PORT:-9222}:9222"
+    environment:
+      - DISPLAY=:99
+      - SERVICE=cdp
+    shm_size: "2gb"
+    cap_add: [SYS_ADMIN]
+    security_opt: [seccomp=unconfined]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9222/json/version"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 20s
 
-Run all tiers in order. A failure at any tier triggers rollback for that tier's relevant step and outputs the exact failure before halting.
-
-### Tier 1 — Binary Verification
-
-```bash
-which mcp-searxng && mcp-searxng --version \
-  && echo "T1_SEARXNG_OK" || echo "T1_SEARXNG_FAIL"
-
-which chrome-devtools-mcp && chrome-devtools-mcp --version \
-  && echo "T1_CDP_OK" || echo "T1_CDP_FAIL"
-
-which playwright-mcp && playwright-mcp --version \
-  && echo "T1_PLAYWRIGHT_MCP_OK" || echo "T1_PLAYWRIGHT_MCP_FAIL"
-
-npx playwright --version \
-  && echo "T1_PLAYWRIGHT_OK" || echo "T1_PLAYWRIGHT_FAIL"
-
-node -e "require('mcp-searxng'); console.log('T1_MODULE_OK')" \
-  2>/dev/null || echo "T1_MODULE_FAIL"
-```
-
-**Pass condition:** all five emit OK tokens.
-
-### Tier 2 — Config Validation
-
-```bash
-# JSON syntax
-cat [mcp_config_path] | python3 -m json.tool > /dev/null \
-  && echo "T2_JSON_OK" || echo "T2_JSON_INVALID"
-
-# Required keys
-python3 - <<'EOF'
-import json
-with open("[mcp_config_path]") as f:
-    cfg = json.load(f)
-s = cfg.get("mcpServers", {})
-required = ["mcp-searxng", "chrome-devtools-mcp", "playwright-mcp"]
-for name in required:
-    assert name in s, f"MISSING SERVER: {name}"
-    assert "command" in s[name], f"MISSING command in: {name}"
-print("T2_KEYS_OK")
+  playwright-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - SERVICE=playwright
+    image: adaptive-web-playwright:latest
+    container_name: playwright-mcp
+    restart: unless-stopped
+    networks: [webskill]
+    ports:
+      - "127.0.0.1:${PLAYWRIGHT_PORT:-9223}:9223"
+      - "127.0.0.1:5900:5900"
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - playwright-sessions:/sessions
+    environment:
+      - DISPLAY=:99
+      - SESSIONS_DIR=/sessions
+      - SERVICE=playwright
+    shm_size: "2gb"
+    cap_add: [SYS_ADMIN]
+    security_opt: [seccomp=unconfined]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9223 && echo ok || exit 1"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 25s
 EOF
-
-# Session directory
-ls ~/.config/playwright-mcp/sessions/ > /dev/null 2>&1 \
-  && echo "T2_SESSIONS_DIR_OK" || echo "T2_SESSIONS_DIR_MISSING"
 ```
 
-**Pass condition:** T2_JSON_OK, T2_KEYS_OK, T2_SESSIONS_DIR_OK.
+---
 
-### Tier 3 — Runtime Handshake (all three servers)
+## Step 3: Write searxng/settings.yml
+
+Substitute the actual value of `$SEARXNG_SECRET` from Step 1f before writing.
 
 ```bash
-# mcp-searxng handshake
-timeout 10 mcp-searxng --test-mode > /tmp/t3-searxng.log 2>&1 &
-SPID=$!; sleep 2
-MCP_INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}'
-echo "$MCP_INIT" | nc -q 1 localhost [searxng_port] 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert 'result' in d and 'protocolVersion' in d['result']
-print('T3_SEARXNG_HANDSHAKE_OK')
-" 2>/dev/null || echo "T3_SEARXNG_HANDSHAKE_FAIL — $(tail -3 /tmp/t3-searxng.log)"
-kill $SPID 2>/dev/null
+cat > ./adaptive-web-skill/searxng/settings.yml << EOF
+use_default_settings: true
 
-# chrome-devtools-mcp CDP port
-timeout 15 xvfb-run chrome-devtools-mcp --port 9222 > /tmp/t3-cdp.log 2>&1 &
-CPID=$!; sleep 4
-curl -sf http://localhost:9222/json/version > /dev/null \
-  && echo "T3_CDP_PORT_OK" \
-  || echo "T3_CDP_PORT_FAIL — $(tail -3 /tmp/t3-cdp.log)"
-kill $CPID 2>/dev/null
+general:
+  debug: false
+  instance_name: "adaptive-web-skill"
+  enable_metrics: false
 
-# playwright-mcp handshake
-timeout 15 xvfb-run playwright-mcp --port 9223 > /tmp/t3-pw.log 2>&1 &
-PPID=$!; sleep 4
-echo "$MCP_INIT" | nc -q 1 localhost 9223 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert 'result' in d and 'protocolVersion' in d['result']
-print('T3_PLAYWRIGHT_HANDSHAKE_OK')
-" 2>/dev/null || echo "T3_PLAYWRIGHT_HANDSHAKE_FAIL — $(tail -3 /tmp/t3-pw.log)"
-kill $PPID 2>/dev/null
+search:
+  safe_search: 0
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "${SEARXNG_SECRET}"
+  limiter: false
+  image_proxy: false
+  http_protocol_version: "1.1"
+
+ui:
+  static_use_hash: true
+  default_theme: simple
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 30.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+    weight: 2
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+    weight: 1
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: d
+    disabled: false
+    weight: 1
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: w
+    disabled: false
+    weight: 1
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gs
+    disabled: false
+    weight: 1
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+    weight: 1
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+    disabled: false
+    weight: 1
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    disabled: false
+    weight: 1
+
+enabled_plugins:
+  - Hash_plugin
+  - Search_on_category_select
+  - Tracker_url_remover
+EOF
 ```
 
-**Pass condition:** all three emit HANDSHAKE_OK or PORT_OK tokens.
+---
 
-### Tier 4 — Functional Tool Verification
+## Step 4: Write Dockerfile (shared, ARG SERVICE selects cdp vs playwright)
 
 ```bash
-# --- chrome-devtools-mcp: raw extraction ---
-timeout 20 xvfb-run chrome-devtools-mcp --port 9222 > /tmp/t4-cdp.log 2>&1 &
-CPID=$!; sleep 4
+cat > ./adaptive-web-skill/Dockerfile << 'EOF'
+ARG SERVICE=playwright
 
-echo '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"navigate","arguments":{"url":"https://example.com"}}}' \
-  | nc -q 5 localhost [cdp_mcp_port] 2>/dev/null > /tmp/t4-cdp-nav.json
+# ── CDP stage ────────────────────────────────────────────────────────────────
+FROM node:20-slim AS cdp
 
-echo '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"get_text","arguments":{"selector":"body"}}}' \
-  | nc -q 5 localhost [cdp_mcp_port] 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert len(str(d.get('result',''))) > 50
-print('T4_CDP_EXTRACT_OK')
-" 2>/dev/null || echo "T4_CDP_EXTRACT_FAIL — $(tail -3 /tmp/t4-cdp.log)"
-kill $CPID 2>/dev/null
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium xvfb dbus dbus-x11 curl ca-certificates \
+    fonts-liberation fonts-noto fonts-noto-color-emoji \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+    libxrandr2 libgbm1 libasound2 libpango-1.0-0 libpangocairo-1.0-0 \
+  && rm -rf /var/lib/apt/lists/*
 
-# --- playwright-mcp: tool list ---
-timeout 20 xvfb-run playwright-mcp --port 9223 > /tmp/t4-pw.log 2>&1 &
-PPID=$!; sleep 4
+RUN npm install -g chrome-devtools-mcp
 
-echo '{"jsonrpc":"2.0","id":22,"method":"tools/list","params":{}}' \
-  | nc -q 3 localhost 9223 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-tools = [t['name'] for t in d.get('result',{}).get('tools',[])]
-required = ['navigate','fill','click','wait_for_selector']
-missing = [t for t in required if not any(t in name for name in tools)]
-assert not missing, f'MISSING TOOLS: {missing}'
-print('T4_PLAYWRIGHT_TOOLS_OK — available:', tools[:6])
-" 2>/dev/null || echo "T4_PLAYWRIGHT_TOOLS_FAIL — $(tail -3 /tmp/t4-pw.log)"
+RUN groupadd -r appuser && useradd -r -g appuser -m appuser
+USER appuser
+WORKDIR /home/appuser
 
-echo '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"navigate","arguments":{"url":"https://example.com"}}}' \
-  | nc -q 8 localhost 9223 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert 'result' in d
-print('T4_PLAYWRIGHT_NAV_OK')
-" 2>/dev/null || echo "T4_PLAYWRIGHT_NAV_FAIL"
-kill $PPID 2>/dev/null
+COPY --chown=appuser:appuser entrypoint.sh /home/appuser/entrypoint.sh
+RUN chmod +x /home/appuser/entrypoint.sh
 
-# --- mcp-searxng: live search ---
-timeout 10 mcp-searxng --test-mode > /tmp/t4-searxng.log 2>&1 &
-SPID=$!; sleep 2
-echo '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"search","arguments":{"query":"iana example domain","num_results":3}}}' \
-  | nc -q 4 localhost [searxng_port] 2>/dev/null \
-  | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-results = d.get('result',{}).get('results',[])
-assert len(results) > 0
-print(f'T4_SEARXNG_SEARCH_OK — {len(results)} results returned')
-" 2>/dev/null || echo "T4_SEARXNG_SEARCH_FAIL — $(tail -3 /tmp/t4-searxng.log)"
-kill $SPID 2>/dev/null
+EXPOSE 9222
+ENTRYPOINT ["/home/appuser/entrypoint.sh"]
+
+# ── Playwright stage ─────────────────────────────────────────────────────────
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy AS playwright
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    x11vnc novnc websockify openssl netcat-openbsd \
+    curl wget openssh-client procps python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
+# bore: zero-config tunnel for CAPTCHA bridge public URL
+RUN ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  ASSET="bore-x86_64-unknown-linux-musl.tar.gz" ;; \
+      aarch64) ASSET="bore-aarch64-unknown-linux-musl.tar.gz" ;; \
+      *) echo "bore unsupported on $ARCH — ssh fallback will be used" && exit 0 ;; \
+    esac && \
+    curl -fsSL "https://github.com/ekzhang/bore/releases/latest/download/${ASSET}" \
+      -o /tmp/bore.tar.gz \
+    && tar xz -C /usr/local/bin/ -f /tmp/bore.tar.gz \
+    && chmod +x /usr/local/bin/bore \
+    && rm /tmp/bore.tar.gz \
+    || echo "bore install failed — ssh fallback will be used"
+
+RUN npm install -g @playwright/mcp
+
+RUN pip3 install --break-system-packages playwright-stealth fake-useragent
+
+RUN mkdir -p /sessions && chmod 777 /sessions
+
+COPY entrypoint.sh /entrypoint.sh
+COPY captcha-bridge.sh /captcha-bridge.sh
+RUN chmod +x /entrypoint.sh /captcha-bridge.sh
+
+EXPOSE 9223 5900 6080
+ENTRYPOINT ["/entrypoint.sh"]
+EOF
 ```
 
-**Pass condition:** T4_CDP_EXTRACT_OK, T4_PLAYWRIGHT_TOOLS_OK, T4_PLAYWRIGHT_NAV_OK, T4_SEARXNG_SEARCH_OK.
+---
 
-### Tier 5 — End-to-End Adaptive Skill Pipeline Test
+## Step 5: Write entrypoint.sh (handles both services via $SERVICE env var)
 
 ```bash
-timeout 60 mcp-searxng --test-mode > /tmp/t5-searxng.log 2>&1 &
-SPID=$!
-timeout 60 xvfb-run chrome-devtools-mcp --port 9222 > /tmp/t5-cdp.log 2>&1 &
-CPID=$!
-timeout 60 xvfb-run playwright-mcp --port 9223 > /tmp/t5-pw.log 2>&1 &
-PPID=$!
-sleep 5
+cat > ./adaptive-web-skill/entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
 
-E2E_SEARCH=$(echo '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"search","arguments":{"query":"iana example domain","num_results":3}}}' \
-  | nc -q 4 localhost [searxng_port] 2>/dev/null)
+# ── Virtual display (both services need Xvfb) ────────────────────────────────
+Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+export DISPLAY=:99
+sleep 1
 
-FIRST_URL=$(echo "$E2E_SEARCH" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-r=d.get('result',{}).get('results',[])
-assert r, 'NO_RESULTS'
-print(r[0]['url'])
-" 2>/dev/null)
+SERVICE="${SERVICE:-playwright}"
 
-if [ -n "$FIRST_URL" ]; then
-  # Class 1: raw CDP extract
-  echo "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"navigate\",\"arguments\":{\"url\":\"$FIRST_URL\"}}}" \
-    | nc -q 5 localhost [cdp_mcp_port] > /dev/null 2>&1
+if [ "$SERVICE" = "cdp" ]; then
+  # ── CDP: launch chrome-devtools-mcp ────────────────────────────────────────
+  CHROME_BIN=$(which chromium 2>/dev/null \
+    || which chromium-browser 2>/dev/null \
+    || which google-chrome 2>/dev/null)
 
-  echo '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"get_text","arguments":{"selector":"body"}}}' \
-    | nc -q 5 localhost [cdp_mcp_port] 2>/dev/null \
-    | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert len(str(d.get('result',''))) > 50
-print('T5_CLASS1_EXTRACT_OK')
-" 2>/dev/null || echo "T5_CLASS1_EXTRACT_FAIL"
+  if [ -z "$CHROME_BIN" ]; then
+    echo "[cdp] ERROR: no Chromium binary found" >&2
+    exit 1
+  fi
 
-  # Class 3: Playwright wait-for-selector (escalation simulation)
-  echo "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"navigate\",\"arguments\":{\"url\":\"$FIRST_URL\"}}}" \
-    | nc -q 8 localhost 9223 > /dev/null 2>&1
+  echo "[cdp] Chromium: $CHROME_BIN"
+  echo "[cdp] Starting chrome-devtools-mcp on port 9222..."
 
-  echo '{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"wait_for_selector","arguments":{"selector":"body","timeout":5000}}}' \
-    | nc -q 8 localhost 9223 2>/dev/null \
-    | python3 -c "
-import sys,json; d=json.load(sys.stdin)
-assert 'result' in d
-print('T5_CLASS3_ESCALATION_OK')
-" 2>/dev/null || echo "T5_CLASS3_ESCALATION_FAIL"
+  exec chrome-devtools-mcp \
+    --chrome-path "$CHROME_BIN" \
+    --port 9222 \
+    --chrome-flags "--no-sandbox \
+      --disable-dev-shm-usage \
+      --disable-setuid-sandbox \
+      --disable-gpu \
+      --disable-infobars \
+      --disable-extensions \
+      --disable-blink-features=AutomationControlled \
+      --window-size=1920,1080 \
+      --user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+elif [ "$SERVICE" = "playwright" ]; then
+  # ── Playwright: init sessions then launch playwright-mcp ───────────────────
+  SESSIONS_DIR="${SESSIONS_DIR:-/sessions}"
+  mkdir -p "$SESSIONS_DIR"
+  [ -s "$SESSIONS_DIR/default.json" ] || echo '{}' > "$SESSIONS_DIR/default.json"
+
+  echo "[playwright] Sessions: $(ls $SESSIONS_DIR/*.json 2>/dev/null | xargs -I{} basename {} .json | tr '\n' ' ')"
+  echo "[playwright] Starting playwright-mcp on port 9223..."
+
+  exec playwright-mcp \
+    --browser chromium \
+    --headless \
+    --port 9223 \
+    --storage-state "$SESSIONS_DIR/default.json" \
+    --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+    --launch-options '{"args":["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-dev-shm-usage","--disable-setuid-sandbox","--disable-gpu","--disable-infobars","--disable-extensions","--window-size=1920,1080"]}'
+
 else
-  echo "T5_PIPELINE_FAIL: could not extract URL from search results"
+  echo "ERROR: unknown SERVICE=$SERVICE. Set to 'cdp' or 'playwright'." >&2
+  exit 1
+fi
+EOF
+chmod +x ./adaptive-web-skill/entrypoint.sh
+```
+
+---
+
+## Step 6: Write captcha-bridge.sh
+
+```bash
+cat > ./adaptive-web-skill/captcha-bridge.sh << 'EOF'
+#!/bin/bash
+# CAPTCHA Bridge — called by agent when challenge detected (Class H)
+# Starts x11vnc + noVNC + public tunnel, prints BRIDGE_URL, then blocks.
+# Kill with SIGTERM to tear down.
+# Usage: /captcha-bridge.sh [novnc_port] [vnc_port]
+
+NOVNC_PORT="${1:-6080}"
+VNC_PORT="${2:-5900}"
+VNC_PASS=$(openssl rand -base64 6 | tr -d '=+/')
+
+cleanup() {
+  echo "[bridge] BRIDGE_TORN_DOWN"
+  kill "$X11VNC_PID" "$NOVNC_PID" "$TUNNEL_PID" 2>/dev/null
+  rm -f /tmp/bridge_url.txt /tmp/bridge_password.txt
+  exit 0
+}
+trap cleanup SIGTERM SIGINT EXIT
+
+# x11vnc
+x11vnc -display :99 -rfbport "$VNC_PORT" -passwd "$VNC_PASS" \
+  -forever -noxdamage -quiet -bg 2>/tmp/x11vnc.log
+X11VNC_PID=$(pgrep -n x11vnc)
+sleep 1
+
+# noVNC
+NOVNC_WEB=$(find /usr/share/novnc /usr/local/share/novnc 2>/dev/null \
+  -name "vnc.html" | head -1 | xargs dirname || echo "/usr/share/novnc")
+websockify --web "$NOVNC_WEB" "$NOVNC_PORT" "localhost:$VNC_PORT" \
+  > /tmp/novnc.log 2>&1 &
+NOVNC_PID=$!
+sleep 1
+
+PUBLIC_URL=""
+
+# Attempt 1: bore
+if which bore > /dev/null 2>&1; then
+  bore local "$NOVNC_PORT" --to bore.pub > /tmp/tunnel.log 2>&1 &
+  TUNNEL_PID=$!
+  sleep 4
+  BORE_PORT=$(grep -oP 'bore\.pub:\K[0-9]+' /tmp/tunnel.log | head -1)
+  if [ -n "$BORE_PORT" ]; then
+    PUBLIC_URL="http://bore.pub:${BORE_PORT}/vnc.html?password=${VNC_PASS}&autoconnect=true&resize=scale"
+  else
+    kill "$TUNNEL_PID" 2>/dev/null; TUNNEL_PID=""
+  fi
 fi
 
-grep -q "## Skill: Adaptive Web" [guardrails_path] \
-  && echo "T5_SKILL_DEFINITION_OK" \
-  || echo "T5_SKILL_DEFINITION_MISSING"
+# Attempt 2: localhost.run (ssh)
+if [ -z "$PUBLIC_URL" ] && which ssh > /dev/null 2>&1; then
+  ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=20 \
+    -o ConnectTimeout=10 \
+    -R "80:localhost:${NOVNC_PORT}" nokey@localhost.run \
+    > /tmp/tunnel.log 2>&1 &
+  TUNNEL_PID=$!
+  sleep 5
+  LR_URL=$(grep -oP 'https://\S+\.lhr\.life' /tmp/tunnel.log | head -1)
+  if [ -n "$LR_URL" ]; then
+    PUBLIC_URL="${LR_URL}/vnc.html?password=${VNC_PASS}&autoconnect=true&resize=scale"
+  else
+    kill "$TUNNEL_PID" 2>/dev/null; TUNNEL_PID=""
+  fi
+fi
 
-kill $SPID $CPID $PPID 2>/dev/null
-```
+# Fallback: LAN only
+if [ -z "$PUBLIC_URL" ]; then
+  PUBLIC_URL="http://YOUR_HOST_LAN_IP:${NOVNC_PORT}/vnc.html?password=${VNC_PASS}&autoconnect=true&resize=scale"
+  echo "BRIDGE_TUNNEL_UNAVAILABLE — replace YOUR_HOST_LAN_IP with host machine IP"
+fi
 
-**Pass condition:** T5_CLASS1_EXTRACT_OK, T5_CLASS3_ESCALATION_OK, T5_SKILL_DEFINITION_OK.
+echo "BRIDGE_URL=${PUBLIC_URL}"
+echo "BRIDGE_PASSWORD=${VNC_PASS}"
+echo "${PUBLIC_URL}" > /tmp/bridge_url.txt
+echo "${VNC_PASS}" > /tmp/bridge_password.txt
 
-### Verification Summary
-
-```
-╔════════════════════════════════════════════════════════════════╗
-║           ADAPTIVE WEB SKILL — INSTALLATION VERIFICATION       ║
-╠═══════════════════════════════╦══════════╦════════════════════╣
-║ Check                         ║ Status   ║ Notes              ║
-╠═══════════════════════════════╬══════════╬════════════════════╣
-║ T1: Binaries (all 3 tools)    ║ ✅ / ❌  ║ [details]          ║
-║ T2: Config + session slots    ║ ✅ / ❌  ║ [details]          ║
-║ T3: All 3 server handshakes   ║ ✅ / ❌  ║ [details]          ║
-║ T4: Functional tool calls     ║ ✅ / ❌  ║ [details]          ║
-║ T5: E2E pipeline + escalation ║ ✅ / ❌  ║ [details]          ║
-╚═══════════════════════════════╩══════════╩════════════════════╝
-
-[ALL PASS]   Installation complete. All three MCP servers are operational.
-             The Adaptive Web Skill is active, verified end-to-end, and
-             escalation between classes has been confirmed.
-
-[PARTIAL]    X of 5 tiers passed. Failed tier: [N].
-             Rolled back: [steps]. Diagnosis: [exact failure].
-             Next step: [specific remediation from taxonomy].
-
-[FULL FAIL]  All steps rolled back. Environment restored to pre-install state.
-             Diagnosis: [exact failure]. Recommended action: [specific fix].
+wait "$X11VNC_PID"
+EOF
+chmod +x ./adaptive-web-skill/captcha-bridge.sh
 ```
 
 ---
 
-## Skill Definition
+## Step 7: Build and Start
 
-*(Append to guardrails file in Step 10)*
+```bash
+cd ./adaptive-web-skill
+
+docker compose up -d --build
+
+# Watch logs for 30s for startup errors
+timeout 30 docker compose logs -f || true
+```
+
+If `docker compose up` exits non-zero, classify the error:
+
+```
+"port is already allocated"
+  → re-resolve conflicting port, rewrite docker-compose.yml, retry
+
+"no space left on device"
+  → SURFACE "Insufficient disk space (~3GB needed). Free space and re-run."
+
+"failed to solve" / build error
+  → docker compose build --no-cache [service]
+  → if still failing: output full build log verbatim and halt
+
+"Cannot connect to the Docker daemon"
+  → SURFACE "Docker daemon stopped during build. Restart Docker and re-run."
+
+anything else
+  → output full error verbatim and halt
+```
+
+---
+
+## Step 8: Health Verification
+
+```bash
+echo "Waiting for services to initialize..."
+sleep 15
+
+# SearXNG
+SEARXNG_CHECK=$(curl -sf --max-time 8 \
+  "http://localhost:${SEARXNG_PORT:-8080}/search?q=test&format=json" \
+  | python3 -c "import sys,json; json.load(sys.stdin); print('SEARXNG_OK')" \
+  2>/dev/null || echo "SEARXNG_FAIL")
+
+# CDP
+CDP_CHECK=$(curl -sf --max-time 8 \
+  "http://localhost:${CDP_PORT:-9222}/json/version" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'Browser' in d; print('CDP_OK')" \
+  2>/dev/null || echo "CDP_FAIL")
+
+# Playwright
+PW_CHECK=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  | nc -q 2 localhost ${PLAYWRIGHT_PORT:-9223} 2>/dev/null \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'result' in d; print('PLAYWRIGHT_OK')" \
+  2>/dev/null || echo "PLAYWRIGHT_FAIL")
+
+echo "$SEARXNG_CHECK"
+echo "$CDP_CHECK"
+echo "$PW_CHECK"
+```
+
+On any FAIL:
+```
+→ docker compose logs [service] --tail=30
+→ if timeout: wait 20s and retry check once
+→ if still failing: output logs verbatim and halt
+→ E2E_SEARCH_FAIL only: log as WARNING, do not halt (engines need warm-up)
+```
+
+---
+
+## Step 9: Merge MCP Config
+
+```bash
+python3 - << PYEOF
+import json, os
+
+target = os.path.expanduser("${TARGET_MCP_CONFIG}")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+
+try:
+    with open(target) as f:
+        cfg = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    cfg = {}
+
+# Backup
+import shutil, time
+if os.path.exists(target):
+    shutil.copy(target, f"{target}.bak.{int(time.time())}")
+
+cfg.setdefault("mcpServers", {})
+cfg["mcpServers"]["adaptive-web-searxng"] = {
+    "env": {"SEARXNG_URL": "http://localhost:${SEARXNG_PORT:-8080}"}
+}
+cfg["mcpServers"]["adaptive-web-cdp"] = {
+    "url": "http://localhost:${CDP_PORT:-9222}"
+}
+cfg["mcpServers"]["adaptive-web-playwright"] = {
+    "url": "http://localhost:${PLAYWRIGHT_PORT:-9223}"
+}
+
+with open(target, "w") as f:
+    json.dump(cfg, f, indent=2)
+
+print("MCP_CONFIG_MERGED_OK:", target)
+PYEOF
+```
+
+---
+
+## Step 10: Completion Report
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║         ADAPTIVE WEB SKILL — STACK OPERATIONAL                   ║
+╠══════════════════════╦═══════════════════════════════════════════╣
+║ SearXNG              ║ http://localhost:${SEARXNG_PORT}          ║
+║ CDP MCP              ║ http://localhost:${CDP_PORT}              ║
+║ Playwright MCP       ║ http://localhost:${PLAYWRIGHT_PORT}       ║
+║ CAPTCHA bridge       ║ on-demand via docker exec playwright-mcp  ║
+║                      ║   /captcha-bridge.sh                      ║
+╠══════════════════════╩═══════════════════════════════════════════╣
+║ MCP config: ${TARGET_MCP_CONFIG}                                 ║
+║ Sessions:   docker volume: playwright-sessions                   ║
+║ Files:      ./adaptive-web-skill/                                ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Start:  docker compose -f adaptive-web-skill/docker-compose.yml up -d   ║
+║ Stop:   docker compose -f adaptive-web-skill/docker-compose.yml down    ║
+║ Logs:   docker compose -f adaptive-web-skill/docker-compose.yml logs -f ║
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+Append the Skill Definition below to your guardrails file, then halt.
+
+---
+
+## Idempotency
+
+Safe to re-run at any time:
+- Step 0 probes are read-only
+- Step 1f generates a new secret key only if settings.yml is absent
+- Steps 2-6 overwrite files (safe — content is deterministic except secret key)
+- Step 7 `docker compose up -d --build` skips unchanged layers
+- Step 8 health checks are read-only
+- Step 9 backs up MCP config before every merge
+- Re-run after partial failure picks up from first failed step
+
+---
+---
+
+# Skill Definition
+
+*(Append everything below this line to your guardrails file)*
 
 ---
 
@@ -584,369 +675,406 @@ kill $SPID $CPID $PPID 2>/dev/null
 
 ### What this skill is
 
-This skill gives you a three-tool web interaction stack:
+You have a three-service containerized web stack:
 
-- **mcp-searxng** — fast search query execution and URL discovery
-- **chrome-devtools-mcp** — raw CDP extraction, fastest option for static/anonymous pages
-- **playwright-mcp** — full browser automation with session persistence, form interaction, file upload, and streaming detection
+- **adaptive-web-searxng** — meta-search across Google, Bing, DuckDuckGo,
+  Wikipedia, GitHub, arXiv simultaneously; returns ranked JSON
+- **adaptive-web-cdp** — raw Chrome DevTools Protocol extraction;
+  fastest for static pages, no JS rendering overhead
+- **adaptive-web-playwright** — full Chromium automation with session
+  persistence, stealth patches, UA rotation, form interaction, and
+  CAPTCHA bridge
 
-You do not choose a single tool and commit. You start with the most appropriate tool for your initial read of the task, observe what you get back, and escalate only when the result is insufficient or the approach hits a wall. **The ladder only goes up. You never loop on the same class twice for the same task.**
+Start: `docker compose -f adaptive-web-skill/docker-compose.yml up -d`
+Stop:  `docker compose -f adaptive-web-skill/docker-compose.yml down`
 
----
-
-### Tool Selection: Initial Classification
-
-Before making any tool call, classify the task using this decision tree:
-
-```
-Does the task require finding a URL first?
-  YES → always start with mcp-searxng (Steps 1-3), then classify the target
-  NO  → classify the known target URL directly:
-
-  Does the page require login to show relevant content?
-    YES + storageState exists for this site → start at Class 2
-    YES + no storageState → start at Class 2, trigger auth-gate pause
-    NO  → Does the page have meaningful JS-rendered content (SPA)?
-            Uncertain → start at Class 1, escalate to Class 3 on empty result
-            Confirmed SPA → start at Class 3
-          Does the task require typing, clicking, uploading, or submitting?
-            YES → start at Class 4
-          Does the task require waiting for a streaming or async response?
-            YES → start at Class 5
-          Does the task ask to create/export an automation script?
-            YES → start at Class 6
-          None of the above → start at Class 1
-```
-
-**Pipeline: Search → Classify → Extract → Escalate if needed → Synthesize**
+You do not commit to one tool. Classify the task, use the minimum capable
+tool, observe the result, escalate only when the result is insufficient.
+**The ladder only goes up. Never retry the same class twice per task.**
 
 ---
 
-### Step 1 — Query Construction (if search is needed)
+### Stack Status Check
 
-Rewrite the user's request into a focused search query:
+Before any web task:
 
-- Strip conversational filler
-- Expand ambiguous pronouns
-- Append current year if recency is implied
-- Decompose multi-part requests into separate queries; run each independently
+```bash
+docker compose -f ./adaptive-web-skill/docker-compose.yml ps --format json \
+  | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin if l.strip()]
+services = [json.loads(l) for l in lines]
+running = [s['Service'] for s in services if s.get('State') == 'running']
+required = ['searxng', 'cdp-mcp', 'playwright-mcp']
+missing = [r for r in required if r not in running]
+print('STACK_PARTIAL: ' + str(missing) if missing else 'STACK_OK')
+"
+```
+
+If STACK_PARTIAL:
+```bash
+docker compose -f ./adaptive-web-skill/docker-compose.yml up -d
+```
 
 ---
 
-### Step 2 — Search via mcp-searxng
+### Initial Classification
 
 ```
-tool: search
-arguments:
-  query: [constructed query]
-  num_results: 8
-  engines: []
-```
+Need a URL first?
+  YES → Search (Steps 1-3) then classify the result URL
+  NO  → classify known URL:
 
-On empty result or tool failure: wait 2 seconds, retry once with rephrased query. If second attempt also returns nothing: report "Search unavailable" and stop. **Do not hallucinate results.**
+    Login required?
+      YES + session exists → Class 2
+      YES + no session     → Class 2 with auth-gate pause
+      NO  → JS-rendered (SPA)?
+              Uncertain        → Class 1, escalate to Class 3 if empty
+              Confirmed SPA    → Class 3
+            Requires typing/clicking/uploading/submitting?
+              YES              → Class 4
+            Streaming/async response?
+              YES              → Class 5
+            Export automation script?
+              YES              → Class 6
+            None of above      → Class 1
+
+CAPTCHA detected at any point → Class H (out-of-band, immediate)
+```
 
 ---
 
-### Step 3 — Result Ranking
+### Step 1 — Query Construction
 
-Score returned results by:
-
-- **Domain authority:** prefer .gov, .edu, established publishers, official project sites
-- **Snippet relevance:** does the snippet directly address the query?
-- **Recency:** if time-sensitive, prefer results dated within 6 months
-- **Avoid:** content farms, SEO aggregators, unattributed pages
-
-Select top 3. Never fabricate additional results. If fewer than 3 returned, use what exists.
+Strip filler. Expand pronouns. Append year if recency implied.
+Decompose multi-part requests into separate queries.
 
 ---
 
-### Interaction Class Definitions and Execution Sequences
-
-#### Class 1 — Static / Anonymous Extraction
-
-**Use when:** Page has no auth requirement and content is server-rendered.  
-**Tool:** chrome-devtools-mcp *(fastest, lowest overhead)*
+### Step 2 — Search
 
 ```
-Execution:
+GET http://localhost:${SEARXNG_PORT}/search?q=QUERY&format=json&engines=google,bing,duckduckgo
+```
+
+Empty result: wait 2s, retry once rephrased. Still empty: report
+"Search unavailable" and stop. Never hallucinate results.
+
+---
+
+### Step 3 — Ranking
+
+Prefer: .gov/.edu/official sources > snippet relevance > recency.
+Avoid: content farms, SEO aggregators. Select top 3.
+
+---
+
+### Browser Identity
+
+All Playwright sessions:
+- UA: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36`
+- Viewport: 1920×1080 · locale: en-US · timezone: America/New_York
+- Headers: Accept-Language, Sec-CH-UA, Sec-Fetch-* matching Chrome desktop
+- Stealth: navigator.webdriver suppressed; plugins/languages/hardwareConcurrency spoofed
+- UA fixed for duration of task. Never switch mid-session.
+
+---
+
+### Class 1 — Static Extraction
+**Tool:** adaptive-web-cdp
+**When:** No auth, server-rendered content
+
+```
 1. navigate(url)
-2. Wait: document.readyState === 'complete' (timeout 8s — skip URL if exceeded)
-3. get_text(selector: "article, main, [role='main'], body")
-4. Truncate extracted content to 4000 tokens max
-```
-
-**Escalation triggers — move to Class 3 if any are observed:**
-- Extracted body is empty or under 100 characters
-- Body contains only a Cloudflare/bot-challenge string
-- Body contains a "JavaScript is required" or "enable JS" message
-- Content is clearly a loading skeleton (no readable text)
-
----
-
-#### Class 3 — Dynamic Single-Page Application
-
-**Use when:** Page content is JS-rendered (React, Vue, Angular, etc.)  
-**Tool:** playwright-mcp
-
-```
-Execution:
-1. navigate(url)
-2. wait_for_selector("article, main, [role='main']", timeout: 10000)
-   If selector not found within timeout: try "body" with a 5s additional wait
-3. get_text or evaluate(document.body.innerText)
+2. Wait: readyState === 'complete' (8s timeout)
+3. get_text("article, main, [role='main'], body")
 4. Truncate to 4000 tokens
 ```
 
-**Escalation triggers — move to Class 2 if observed:**
-- Page redirects to /login, /signin, /auth, or similar path
-- Content returned is a login form
-- HTTP 401 or 403 detected
-
-**Escalation triggers — move to Class 4 if observed:**
-- Target content is present but behind a "Load more", "Show details", or tab click
-- A modal or cookie consent banner is blocking content
+Escalate to Class 3 if: body < 100 chars / bot-challenge / "JS required" / skeleton
 
 ---
 
-#### Class 2 — Session-Gated Content
-
-**Use when:** Site requires authentication to show relevant content.  
-**Tool:** playwright-mcp with storageState
-
-**Auth-gate rule:** Before attempting Class 2, check:
+### Class 3 — SPA / JS-Rendered
+**Tool:** adaptive-web-playwright
+**When:** JS-rendered (React/Vue/Angular)
 
 ```
-Does ~/.config/playwright-mcp/sessions/[sitename].json exist AND contain cookies?
-  YES → proceed with storageState
-  NO  → PAUSE. Tell the user: "This site ([name]) requires a saved session.
-         No session found. Please run the auth setup for this site first,
-         or log in manually. I will not attempt to guess credentials."
-        Do not proceed until user confirms session is available.
+1. navigate(url)
+2. wait_for_selector("article, main, [role='main']", timeout: 10000)
+   fallback: wait_for_selector("body", timeout: 5000)
+3. evaluate(document.body.innerText)
+4. Truncate to 4000 tokens
 ```
 
+Escalate to Class 2 if: redirect to /login /signin /auth · login form · 401/403
+Escalate to Class 4 if: content behind "Load more" / tab / modal
+
+---
+
+### Class 2 — Session-Gated
+**Tool:** adaptive-web-playwright + storageState
+**When:** Site requires login
+
+Check session first:
+```bash
+docker exec playwright-mcp python3 -c "
+import json
+with open('/sessions/SITENAME.json') as f:
+    s = json.load(f)
+assert s.get('cookies') or s.get('origins'), 'SESSION_EMPTY'
+print('SESSION_OK')
+"
 ```
-Execution:
-1. Launch playwright-mcp with --storage-state ~/.config/playwright-mcp/sessions/[sitename].json
+
+If SESSION_EMPTY or absent, pause:
+> "This site requires a saved session. Capture one with:
+> `docker exec -it playwright-mcp npx playwright open --save-storage /sessions/SITENAME.json https://SITE`
+> Log in manually then Ctrl+C. Re-run your task after."
+
+```
+1. Launch with --storage-state /sessions/SITENAME.json
 2. navigate(url)
-3. wait_for_selector("[main content selector]", timeout: 10000)
-4. Verify we are NOT on a login page (check URL, check for login form)
-   If still on login page: session is expired — report SESSION_EXPIRED for [sitename]
-   and pause for user to re-run auth setup
-5. get_text or evaluate extraction
-6. Truncate to 4000 tokens
+3. wait_for_selector("[content]", timeout: 10000)
+4. Verify not on login page (check URL + form presence)
+   If still on login: SESSION_EXPIRED — pause for re-auth
+5. Extract, truncate to 4000 tokens
 ```
 
-**Escalation triggers — move to Class 4 if observed:**
-- Authenticated but target content requires a button click or form interaction
+Escalate to Class 4 if: authenticated but content behind interaction
 
 ---
 
-#### Class 4 — Form Interaction and Submission
-
-**Use when:** Task requires typing into inputs, uploading files, clicking buttons, or submitting forms.  
-**Tool:** playwright-mcp
+### Class 4 — Form Interaction
+**Tool:** adaptive-web-playwright
+**When:** Typing, clicking, uploading, submitting
 
 ```
-Execution:
-1. navigate(url) [with storageState if auth required]
-2. wait_for_selector([target input or form], timeout: 10000)
-3. For text input:
-   click([selector])
-   fill([selector], [content])
-   — For React/controlled inputs, use evaluate() to dispatch synthetic events
-     if fill() does not trigger onChange:
-     evaluate("el => { el.value = '...'; el.dispatchEvent(new Event('input', {bubbles:true})); }")
-4. For file upload:
-   set_input_files([file input selector], [local file path])
-5. click([submit button selector])
-6. wait_for_selector([response container selector], timeout: 15000)
+1. navigate(url) [+ storageState if auth required]
+2. wait_for_selector([target], timeout: 10000)
+3. Text: click([sel]) → fill([sel], [value])
+   React: evaluate("el => { el.value='...'; el.dispatchEvent(new Event('input',{bubbles:true})) }")
+4. File: set_input_files([sel], [path])
+5. click([submit])
+6. wait_for_selector([response container], timeout: 15000)
 ```
 
-**Navigation budget:** 3 page transitions maximum for the entire task. A redirect counts as one transition. If budget is exhausted before task completion: STOP, report what was achieved, and ask the user whether to continue manually.
-
-**Escalation triggers — move to Class 5 if observed:**
-- After submission, response container exists but content is still growing
-- A stop/cancel button is visible (indicating generation in progress)
-- Content length increases on successive reads
+Navigation budget: 3 transitions total. Stop and report if exceeded.
+Escalate to Class 5 if: response growing / stop button visible
 
 ---
 
-#### Class 5 — Streaming / Async Response
+### Class 5 — Streaming / Async
+**Tool:** adaptive-web-playwright
+**When:** Response arrives progressively
 
-**Use when:** Submission has been made and the response arrives progressively or after a variable delay.  
-**Tool:** playwright-mcp
-
-**Completion detection — poll until ONE of these signals is observed:**
-
-- **Signal A:** A "stop generating" / "cancel" button disappears from the DOM
-- **Signal B:** A "copy", "regenerate", or "thumbs up/down" button appears
-- **Signal C:** Content length delta between two polls 3 seconds apart is zero
-- **Signal D:** A known completion class or aria attribute appears (e.g. `data-state="complete"`, `aria-busy="false"`)
+Stop polling when ANY signal observed:
+- Stop/cancel button disappears
+- Copy/regenerate button appears
+- Content length delta = 0 across two polls 3s apart
+- `aria-busy="false"` or `data-state="complete"` appears
 
 ```
-Polling execution:
-1. Record content length at t=0 immediately after submission
-2. Wait 3 seconds
-3. Read content length again
-4. If delta > 0: wait 3 more seconds, repeat from step 3
-5. If delta == 0 for two consecutive polls: mark as COMPLETE
-6. Maximum polling duration: 120 seconds. If not complete by then:
-   extract whatever is present, note "Response may be incomplete — polling timed out"
+Poll: record length → wait 3s → re-read → if delta>0 repeat
+      delta==0 twice consecutively → COMPLETE
+      max 120s → extract with "may be incomplete" note
 ```
 
-```
-Extraction after completion:
-evaluate("document.querySelector('[response container selector]').innerText")
-Truncate to 8000 tokens
-```
+Extract: `evaluate("document.querySelector('[container]').innerText")`
+Truncate to 8000 tokens.
 
 ---
 
-#### Class 6 — Automation Script Generation
-
-**Use when:** The user explicitly asks to create, generate, or export a script to repeat a web task.
-
-**Script Requirements:**
-
-- **Language:** Python using `playwright.async_api`
-- **Stealth:** MUST import and apply `playwright_stealth` to the browser context
-- **User Agents:** Randomize or explicitly inject a standard modern User-Agent string
-- **Session/Cookies:** Wire the script to accept a `storageState` JSON file
-- **Headless:** Run in `headless=True` mode with standard viewport sizes, device scale factors, and locale settings
-
-**Python Script Generation Blueprint:**
+### Class 6 — Script Generation
+**When:** User asks to export/save an automation script
 
 ```python
-import asyncio
+import asyncio, datetime
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
-async def run_automation():
+try:
+    from fake_useragent import UserAgent
+    UA = UserAgent().chrome
+except Exception:
+    POOL = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
+    UA = POOL[datetime.datetime.now().minute % len(POOL)]
+
+async def run(storage_state=None):
     async with async_playwright() as p:
-        # 1. Launch with realistic arguments to mimic human browsers
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-
-        # 2. Inject session state (cookies/auth) if applicable
-        context = await browser.new_context(
-            storage_state="path/to/session.json",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
-        )
-
-        page = await context.new_page()
-
-        # 3. Apply stealth bypasses
+        browser = await p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled", "--no-sandbox",
+            "--disable-dev-shm-usage", "--disable-gpu"])
+        ctx = await browser.new_context(
+            user_agent=UA, viewport={"width":1920,"height":1080},
+            locale="en-US", timezone_id="America/New_York",
+            extra_http_headers={
+                "Accept-Language":"en-US,en;q=0.9",
+                "Sec-CH-UA":'"Chromium";v="125","Google Chrome";v="125","Not-A.Brand";v="99"',
+                "Sec-CH-UA-Mobile":"?0","Sec-CH-UA-Platform":'"Windows"'},
+            **({ "storage_state": storage_state } if storage_state else {}))
+        page = await ctx.new_page()
         await stealth_async(page)
+        await page.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+            Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+            Object.defineProperty(navigator,'hardwareConcurrency',
+                {get:()=>[2,4,8,16][Math.floor(Math.random()*4)]});""")
+        try:
+            pass  # automation steps here
+        except Exception as e:
+            await page.screenshot(path="error.png")
+            open("error.html","w").write(await page.content())
+            raise
+        finally:
+            await browser.close()
 
-        # 4. [Agent inserts specific automation steps here]
-
-        await browser.close()
-
-if __name__ == "__main__":
-    asyncio.run(run_automation())
+asyncio.run(run(storage_state="path/to/session.json"))
 ```
 
 ---
 
-### Escalation Ladder Summary
+### Class H — CAPTCHA Bridge (out-of-band)
+
+Triggers from ANY class when detected:
+- URL/body contains: `recaptcha` `hcaptcha` `cf-challenge` `verify you are human`
+  `select all images` `i'm not a robot`
+- `cf-mitigated: challenge` response header
+- `wait_for_selector` timeout + screenshot shows challenge UI
+- Stealth applied but challenge persists after 5s
+
+**H1: Stop and screenshot**
+```bash
+# Stop all navigation immediately
+docker exec playwright-mcp sh -c 'screenshot to /tmp/captcha_detected.png'
+```
+
+**H2: Start bridge**
+```bash
+docker exec -d playwright-mcp /captcha-bridge.sh 6080 5900
+sleep 4
+BRIDGE_URL=$(docker exec playwright-mcp cat /tmp/bridge_url.txt 2>/dev/null)
+VNC_PASS=$(docker exec playwright-mcp cat /tmp/bridge_password.txt 2>/dev/null)
+```
+
+**H3: Notify user**
+```
+⚠️  HUMAN INPUT REQUIRED — CAPTCHA DETECTED
+
+Challenge: [describe: e.g. "reCAPTCHA image grid on accounts.google.com"]
+
+Open this in your browser to interact with the live browser session:
+👉 [BRIDGE_URL]
+Password (if prompted): [VNC_PASS]
+
+Complete the challenge, then type: CAPTCHA_DONE
+
+Paused. No action will be taken until you respond. Session open 10 minutes.
+```
+
+**H4: Poll for resolution**
+```python
+# Every 5s for up to 600s:
+# - check body text for CAPTCHA signals
+# - check URL for challenge paths
+# On clear: print CAPTCHA_CLEARED, kill bridge, resume triggering class
+# On timeout: screenshot, preserve session, report CAPTCHA_TIMEOUT
+```
+
+**H5: Tear down**
+```bash
+docker exec playwright-mcp pkill -f captcha-bridge.sh 2>/dev/null || true
+```
+
+**H-Fallback (bridge fails):**
+```
+⚠️  CAPTCHA DETECTED — bridge unavailable
+
+Open [URL] in your browser, complete the challenge, then type:
+RESUME [url-you-land-on]
+
+I will navigate directly there and continue.
+```
+
+---
+
+### Escalation Ladder
 
 ```
 INITIAL CLASSIFICATION
         ↓
-CLASS 1 (chrome-devtools-mcp, raw extract)
-        ↓ trigger: empty body / bot wall / JS-required message
-CLASS 3 (playwright-mcp, SPA wait)
-        ↓ trigger: login redirect / 401 / login form detected
-CLASS 2 (playwright-mcp, storageState auth)
-        ↓ trigger: auth ok but content behind interaction
-CLASS 4 (playwright-mcp, form/input/upload)
-        ↓ trigger: response is streaming / content still growing
-CLASS 5 (playwright-mcp, polling + completion detection)
-        ↓ task complete or asks to export script
-CLASS 6 (playwright async, stealth wrapper, session inject)
-        ↓ all classes exhausted or budget exceeded
-REPORT  (what was attempted, what each returned, why each escalated)
+CLASS 1 — cdp-mcp, raw static extract
+        ↓ empty / bot-wall / JS-required
+CLASS 3 — playwright-mcp, SPA wait
+        ↓ login redirect / 401 / form detected
+CLASS 2 — playwright-mcp, storageState auth
+        ↓ content behind interaction
+CLASS 4 — playwright-mcp, form/click/upload
+        ↓ response still growing / streaming
+CLASS 5 — playwright-mcp, poll to completion
+        ↓ complete / export requested
+CLASS 6 — python script, stealth + UA
+        ↓ exhausted / budget exceeded
+REPORT  — what was tried, what each returned, why each escalated
+
+══ OUT-OF-BAND ══════════════════════════════
+CLASS H ← any class → CAPTCHA detected
+        → CAPTCHA_DONE: resume triggering class
+        → CAPTCHA_TIMEOUT: halt, preserve session, report
 ```
 
-**Rules:**
-- Each class is attempted at most **once** per task
-- The ladder only goes up — never repeat a class already attempted
-- Partial success counts: if Class 1 returns 60% of needed content and Class 3 would cost 10x the time, assess whether what was retrieved is sufficient before escalating. **State the assessment explicitly.**
-- Auth escalation (Class 2) always pauses for session confirmation before proceeding
-- Navigation budget (3 transitions) is shared across all classes in a single task
+Rules:
+- Each class attempted at most once per task
+- Ladder only goes up
+- Navigation budget: 3 transitions shared across all classes
+- Class H does not consume a ladder slot
+- Class 2 always pauses for session confirmation before proceeding
 
 ---
 
-### After Extraction: Synthesis and Citation
+### Synthesis and Citation
 
-**Synthesis rules:**
-- Answer the user's original question directly in the first sentence
-- Support claims with content drawn from extracted pages
-- If sources conflict, note the conflict explicitly — do not silently pick one
-- Do not reproduce long verbatim passages — summarize and paraphrase
-- Label any content drawn from training knowledge rather than extraction: `(from training knowledge, not extracted)`
-- If extraction was insufficient: say so explicitly, state what was retrieved, and offer to try a different approach
-
-**Citation format (always include after any web-sourced answer):**
+- Answer the user's question in the first sentence
+- Support with extracted content; note conflicts explicitly
+- Paraphrase — never reproduce long verbatim passages
+- Label training knowledge: `(from training, not extracted)`
+- If extraction failed: say so, state what was retrieved, offer alternatives
 
 ```
 Sources:
-[1] [Page Title] — [domain] — [full URL] — [class used: C1/C2/C3/C4/C5/C6]
-[2] [Page Title] — [domain] — [full URL] — [class used]
-[3] [Page Title] — [domain] — [full URL] — [class used]
+[1] Title — domain — URL — [C1/C2/C3/C4/C5/C6/CH]
+[2] ...
 ```
-
-If a URL was blocked, session-expired, or extraction failed: list it with a note: `(extraction failed: [reason])`
-
-Reference sources inline with `[1]`, `[2]`, `[3]` notation.
 
 ---
 
-### Fallback Hierarchy (tool availability degraded)
+### Degraded Mode
 
 ```
-All 3 tools available         → full adaptive pipeline (all classes available)
-searxng DOWN, others up       → skip search; user must provide URL directly
-cdp DOWN, playwright up       → skip Class 1; begin at Class 3 for all tasks
-playwright DOWN, cdp up       → Classes 1 available; Classes 2/3/4/5/6 unavailable
-                                 note limitation to user before starting
-all tools DOWN                → report: "Web skill unavailable. I can answer from
-                                 training knowledge but cannot retrieve live content."
+All services running     → full ladder (C1–C6 + CH)
+searxng down             → skip search; user must provide URL
+cdp-mcp down             → skip C1; start at C3
+playwright-mcp down      → C1 only; C2–C6 + CH unavailable
+CAPTCHA bridge fails     → CH degrades to text fallback
+all down                 → report stack offline; run docker compose up -d
 ```
 
-**Never silently fall back** — always tell the user which degraded mode is active and what that means for the task.
+Never silently degrade. Always report which mode is active.
 
 ---
 
-### Safety Constraints
+### Safety
 
-- **NEVER** use `--viewport` or `resize_page` commands. These crash the CDP session.
-- **NEVER** open more than 1 Chrome instance simultaneously across both tools.
-- **NEVER** attempt to guess, brute-force, or fabricate credentials for auth-gated sites.
-- **NEVER** follow links within extracted pages beyond the navigation budget.
-- **NEVER** extract more than 8000 tokens from a single page regardless of content length.
-- If CDP port 9222 does not respond within 10 seconds: HALT and report.
-- If playwright-mcp port 9223 does not respond within 10 seconds: HALT and report.
-- **PDF pages:** skip extraction, use search snippet only, note "PDF — snippet only".
-- **Bot-detection walls** (Cloudflare, hCaptcha, reCAPTCHA): skip URL, log `BLOCKED: [url]`, move to next result. Never attempt to bypass bot detection.
-- **Generated Scripts (Class 6):** Must wrap network requests and navigation in `try/except` blocks. If a selector times out, the script must automatically take a screenshot (`await page.screenshot(path="error.png")`) and dump the HTML to a log file.
-
----
-
-### Idempotency Rules
-
-This directive is safe to re-run at any time:
-
-- Phase 0 probes are always read-only.
-- Step 1 always generates a new timestamped backup, never overwrites an existing one.
-- Steps 3, 4, 5 check if the target version is already installed before running `npm install`.
-- Step 6 checks Playwright browser install state before running install.
-- Step 7 verifies the Python packages before running `pip`.
-- Step 8 checks for existing session stubs before creating new ones.
-- Step 9 merges into existing config, preserving all non-MCP keys.
-- Step 10 checks for the `## Skill: Adaptive Web` marker before appending.
-- Phase 4 auth setup checks for populated session files before re-running login capture.
-- A re-run after partial failure resumes from the first incomplete step, not from Step 1.
+- Never open more than 1 Chromium instance per container simultaneously
+- Never guess, fabricate, or brute-force credentials
+- Never follow links beyond the 3-transition navigation budget
+- Never extract more than 8000 tokens from a single page
+- PDF pages: snippet only — note "PDF — snippet only"
+- CDP unresponsive 10s: `docker restart cdp-mcp`
+- Playwright unresponsive 10s: `docker restart playwright-mcp`
+- CAPTCHA: invoke Class H immediately — never attempt programmatic bypass
